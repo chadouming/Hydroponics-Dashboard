@@ -32,6 +32,13 @@ esphome:
   name: ${name}
   friendly_name: ${friendly_name}
   min_version: 2026.5.0
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          // Canvas buffers start uninitialised: paint them the tile colour.
+          for (lv_obj_t *c : {id(ph_graph), id(ec_graph), id(orp_graph), id(temp_graph)})
+            lv_canvas_fill_bg(c, lv_color_hex(0x232325), LV_OPA_COVER);
 
 esp32:
   variant: esp32s3
@@ -113,3 +120,223 @@ sensor:
     id: temp
     entity_id: ${ent_temp}
     internal: true
+
+font:
+  - id: f_name  # tile titles, e.g. "pH (5.8 – 6.2)" (default GF_Latin_Kernel has "–")
+    file: "gfonts://Roboto@400"
+    size: 17
+    bpp: 4
+  - id: f_value  # tile values
+    file: "gfonts://Roboto@700"
+    size: 38
+    bpp: 4
+    glyphs: "0123456789.-—"
+  - id: f_unit
+    file: "gfonts://Roboto@700"
+    size: 18
+    bpp: 4
+    glyphs: "µS/cmV°C"
+  - id: f_icon  # Material Design Icons used by the HA card
+    file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/v7.4.47/fonts/materialdesignicons-webfont.ttf"
+    size: 24
+    bpp: 4
+    glyphs:
+      - "\U000F124B"  # mdi:flask-round-bottom
+      - "\U000F0241"  # mdi:flash
+      - "\U000F1855"  # mdi:water-opacity
+      - "\U000F1A80"  # mdi:thermometer-water
+  - id: f_gauge_value
+    file: "gfonts://Roboto@500"
+    size: 54
+    bpp: 4
+    glyphs: "0123456789.-—"
+  - id: f_gauge_name
+    file: "gfonts://Roboto@400"
+    size: 20
+    bpp: 4
+  - id: f_note
+    file: "gfonts://Roboto@400"
+    size: 16
+    bpp: 4
+
+lvgl:
+  displays: main_display
+  log_level: WARN
+  default_font: f_note
+  style_definitions:
+    - id: tile_style  # card_mod: rgba(255,255,255,.03) fill, .06 border, 16px radius
+      bg_color: 0x232325
+      bg_opa: COVER
+      border_color: 0x2A2A2C
+      border_width: 1
+      radius: 16
+      pad_all: 0
+    - id: bare_style  # invisible container
+      bg_opa: TRANSP
+      border_width: 0
+      radius: 0
+      pad_all: 0
+  pages:
+    - id: main_page
+      bg_color: 0x1C1C1E
+      bg_opa: COVER
+      pad_all: 0
+      scrollable: false
+      scrollbar_mode: "OFF"
+      widgets:
+        # ---------------- Health Index gauge (left column 14,14 290x452) ----------------
+        - meter:
+            id: kpi_meter
+            x: 34  # square 250x250, centre at (159,264), arc outer radius 125
+            y: 139
+            width: 250
+            height: 250
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            indicator:  # the pivot dot: hidden
+              bg_opa: TRANSP
+            scales:
+              - range_from: 0
+                range_to: 100
+                angle_range: 180
+                rotation: 180  # top semicircle, 0 on the left
+                indicators:  # no ticks: key => no ticks or labels
+                  - arc: {color: 0xEF4444, width: 38, start_value: 0, end_value: 65}
+                  - arc: {color: 0xF59E0B, width: 38, start_value: 65, end_value: 85}
+                  - arc: {color: 0x10B981, width: 38, start_value: 85, end_value: 100}
+                  - line:
+                      id: kpi_needle
+                      color: 0xE1E1E1
+                      width: 6
+                      rounded: true
+                      radial_offset: 70  # from r=70 ...
+                      length: 55         # ... to the arc's outer edge (r=125)
+                      value: 0
+                      opa: 0%            # hidden until the first value arrives
+        - label:
+            id: kpi_value
+            x: 14
+            y: 200
+            width: 290
+            text_align: CENTER
+            text_font: f_gauge_value
+            text_color: 0xE1E1E1
+            text: "—"
+        - label:
+            x: 14
+            y: 284
+            width: 290
+            text_align: CENTER
+            text_font: f_gauge_name
+            text_color: 0xE1E1E1
+            text: "Growell 1 Health Index"
+        - label:
+            id: ha_note  # hidden while Home Assistant is connected
+            x: 14
+            y: 420
+            width: 290
+            text_align: CENTER
+            text_font: f_note
+            text_color: 0xF59E0B
+            text: "Home Assistant disconnected"
+        # ---------------- pH tile ----------------
+        - obj:
+            styles: tile_style
+            x: 316
+            y: 14
+            width: 229
+            height: 220
+            scrollable: false
+            scrollbar_mode: "OFF"
+            widgets:
+              - label: {x: 12, y: 12, text: "pH (5.8 – 6.2)", text_font: f_name, text_color: 0x9B9B9B}
+              - label: {align: TOP_RIGHT, x: -12, y: 10, text: "\U000F124B", text_font: f_icon, text_color: 0x44739E}
+              - obj:
+                  styles: bare_style
+                  x: 12
+                  y: 40
+                  width: SIZE_CONTENT
+                  height: SIZE_CONTENT
+                  scrollable: false
+                  scrollbar_mode: "OFF"
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: END, pad_column: 6}
+                  widgets:
+                    - label: {id: ph_value, text: "—", text_font: f_value, text_color: 0x9B9B9B}
+                    - label: {id: ph_unit, text: "", text_font: f_unit, text_color: 0x9B9B9B, pad_bottom: 5}
+              - canvas: {id: ph_graph, x: 10, y: 104, width: 207, height: 105, transparent: false}
+        # ---------------- EC tile ----------------
+        - obj:
+            styles: tile_style
+            x: 557
+            y: 14
+            width: 229
+            height: 220
+            scrollable: false
+            scrollbar_mode: "OFF"
+            widgets:
+              - label: {x: 12, y: 12, text: "EC (2000 – 2500)", text_font: f_name, text_color: 0x9B9B9B}
+              - label: {align: TOP_RIGHT, x: -12, y: 10, text: "\U000F0241", text_font: f_icon, text_color: 0x44739E}
+              - obj:
+                  styles: bare_style
+                  x: 12
+                  y: 40
+                  width: SIZE_CONTENT
+                  height: SIZE_CONTENT
+                  scrollable: false
+                  scrollbar_mode: "OFF"
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: END, pad_column: 6}
+                  widgets:
+                    - label: {id: ec_value, text: "—", text_font: f_value, text_color: 0x9B9B9B}
+                    - label: {id: ec_unit, text: "µS/cm", text_font: f_unit, text_color: 0x9B9B9B, pad_bottom: 5}
+              - canvas: {id: ec_graph, x: 10, y: 104, width: 207, height: 105, transparent: false}
+        # ---------------- ORP tile ----------------
+        - obj:
+            styles: tile_style
+            x: 316
+            y: 246
+            width: 229
+            height: 220
+            scrollable: false
+            scrollbar_mode: "OFF"
+            widgets:
+              - label: {x: 12, y: 12, text: "ORP (300 – 400)", text_font: f_name, text_color: 0x9B9B9B}
+              - label: {align: TOP_RIGHT, x: -12, y: 10, text: "\U000F1855", text_font: f_icon, text_color: 0x44739E}
+              - obj:
+                  styles: bare_style
+                  x: 12
+                  y: 40
+                  width: SIZE_CONTENT
+                  height: SIZE_CONTENT
+                  scrollable: false
+                  scrollbar_mode: "OFF"
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: END, pad_column: 6}
+                  widgets:
+                    - label: {id: orp_value, text: "—", text_font: f_value, text_color: 0x9B9B9B}
+                    - label: {id: orp_unit, text: "mV", text_font: f_unit, text_color: 0x9B9B9B, pad_bottom: 5}
+              - canvas: {id: orp_graph, x: 10, y: 104, width: 207, height: 105, transparent: false}
+        # ---------------- Temp tile ----------------
+        - obj:
+            styles: tile_style
+            x: 557
+            y: 246
+            width: 229
+            height: 220
+            scrollable: false
+            scrollbar_mode: "OFF"
+            widgets:
+              - label: {x: 12, y: 12, text: "Temp (18 – 21)", text_font: f_name, text_color: 0x9B9B9B}
+              - label: {align: TOP_RIGHT, x: -12, y: 10, text: "\U000F1A80", text_font: f_icon, text_color: 0x44739E}
+              - obj:
+                  styles: bare_style
+                  x: 12
+                  y: 40
+                  width: SIZE_CONTENT
+                  height: SIZE_CONTENT
+                  scrollable: false
+                  scrollbar_mode: "OFF"
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: END, pad_column: 6}
+                  widgets:
+                    - label: {id: temp_value, text: "—", text_font: f_value, text_color: 0x9B9B9B}
+                    - label: {id: temp_unit, text: "°C", text_font: f_unit, text_color: 0x9B9B9B, pad_bottom: 5}
+              - canvas: {id: temp_graph, x: 10, y: 104, width: 207, height: 105, transparent: false}
