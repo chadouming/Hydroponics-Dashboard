@@ -39,6 +39,16 @@ esphome:
           // Canvas buffers start uninitialised: paint them the tile colour.
           for (lv_obj_t *c : {id(ph_graph), id(ec_graph), id(orp_graph), id(temp_graph)})
             lv_canvas_fill_bg(c, lv_color_hex(0x232325), LV_OPA_COVER);
+          // Home Assistant origin for REST calls: ha_url without any path or query.
+          const std::string base = "${ha_url}";
+          // BEGIN unit ha_origin
+          std::string origin = base;
+          const size_t scheme = origin.find("://");
+          const size_t cut = origin.find_first_of("/?#", scheme == std::string::npos ? 0 : scheme + 3);
+          if (cut != std::string::npos)
+            origin.erase(cut);
+          // END unit ha_origin
+          id(g_ha_origin) = origin;
 
 esp32:
   variant: esp32s3
@@ -576,14 +586,10 @@ script:
                   - http_request.get:
                       url: !lambda |-
                         static const char *const ENTITY[4] = {"${ent_ph}", "${ent_ec}", "${ent_orp}", "${ent_temp}"};
-                        const std::string base = "${ha_url}";
+                        const std::string &origin = id(g_ha_origin);
                         const char *entity = ENTITY[iteration];
                         // BEGIN unit history_url
-                        std::string url = base;  // keep scheme://host:port, drop any path copied along
-                        const size_t scheme = url.find("://");
-                        const size_t path = url.find('/', scheme == std::string::npos ? 0 : scheme + 3);
-                        if (path != std::string::npos)
-                          url.erase(path);
+                        std::string url = origin;
                         url += "/api/history/period?filter_entity_id=";
                         url += entity;
                         url += "&minimal_response&no_attributes";  // default window: last 24 h
@@ -809,6 +815,9 @@ globals:
   - id: g_bf_next
     type: uint32_t
     initial_value: "0"
+  # Home Assistant origin (scheme://host:port), derived from ha_url at boot.
+  - id: g_ha_origin
+    type: std::string
 
 interval:
   - interval: 60s

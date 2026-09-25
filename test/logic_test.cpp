@@ -196,8 +196,13 @@ static void test_segment_cuts() {
   CHECK(cuts_are(segment_cuts(3, 30, 10), {0, 0.2995f, 0.4495f, 0.6f, 0.7f, 1}));
 }
 
-// ---------------- history_url / backfill_accumulate / hist_parser ----------------
-static std::string history_url(const std::string &base, const char *entity) {
+// ---------------- ha_origin / history_url / backfill_accumulate / hist_parser ----------------
+static std::string ha_origin(const std::string &base) {
+#include "build/ha_origin.inc"
+  return origin;
+}
+
+static std::string history_url(const std::string &origin, const char *entity) {
 #include "build/history_url.inc"
   return url;
 }
@@ -241,15 +246,19 @@ static const std::string SAMPLE =
     "{\"state\":\"unavailable\",\"last_changed\":\"2026-09-24T11:00:00+00:00\"},"
     "{\"state\":\"5.90\",\"last_changed\":\"2026-09-24T12:00:00.123456Z\"}]]";
 
+static void test_ha_origin() {
+  CHECK(ha_origin("http://ha:8123") == "http://ha:8123");
+  CHECK(ha_origin("http://ha:8123/") == "http://ha:8123");  // trailing slash
+  CHECK(ha_origin("http://ha:8123//") == "http://ha:8123");
+  CHECK(ha_origin("http://ha:8123/lovelace/0") == "http://ha:8123");  // dashboard URL from the browser
+  CHECK(ha_origin("https://ha.example.com/dashboard-garden/0?edit=1") == "https://ha.example.com");
+  CHECK(ha_origin("http://192.168.1.10:8123?x=1") == "http://192.168.1.10:8123");  // query, no path
+  CHECK(ha_origin("http://192.168.1.10:8123#top") == "http://192.168.1.10:8123");
+}
+
 static void test_history_url() {
-  const char *tail = "/api/history/period?filter_entity_id=sensor.x&minimal_response&no_attributes";
-  CHECK(history_url("http://ha:8123", "sensor.x") == std::string("http://ha:8123") + tail);
-  CHECK(history_url("http://ha:8123/", "sensor.x") == std::string("http://ha:8123") + tail);  // trailing slash
-  CHECK(history_url("http://ha:8123//", "sensor.x") == std::string("http://ha:8123") + tail);
-  // A dashboard URL copied from the browser: keep only scheme://host:port.
-  CHECK(history_url("http://ha:8123/lovelace/0", "sensor.x") == std::string("http://ha:8123") + tail);
-  CHECK(history_url("https://ha.example.com/dashboard-garden/0?edit=1", "sensor.x") ==
-        std::string("https://ha.example.com") + tail);
+  CHECK(history_url("http://ha:8123", "sensor.x") ==
+        "http://ha:8123/api/history/period?filter_entity_id=sensor.x&minimal_response&no_attributes");
 }
 
 static void test_parse_iso() {
@@ -344,6 +353,7 @@ int main() {
   test_graph_points_and_range();
   test_graph_band();
   test_segment_cuts();
+  test_ha_origin();
   test_history_url();
   test_parse_iso();
   test_parser();
