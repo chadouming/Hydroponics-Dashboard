@@ -361,7 +361,7 @@ lvgl:
               - canvas: {id: temp_graph, x: 10, y: 104, width: 207, height: 105, transparent: false}
 
 script:
-  # New reading for tile i (0 pH, 1 EC, 2 ORP, 3 Temp): value text + colour.
+  # New reading for tile i (0 pH, 1 EC, 2 ORP, 3 Temp): value text + colour, then history.
   - id: tile_update
     parameters:
       i: int
@@ -393,3 +393,192 @@ script:
             lv_label_set_text_fmt(VALUE[i], FORMAT[i], v);
           lv_obj_set_style_text_color(VALUE[i], lv_color_hex(col), LV_PART_MAIN);
           lv_obj_set_style_text_color(UNIT[i], lv_color_hex(col), LV_PART_MAIN);
+
+          // History: only real readings, and only once the clock is set.
+          if (std::isnan(v) || !id(ha_time)->now().is_valid())
+            return;
+          id(graph_advance)->execute(i);
+          id(g_sum)[i][47] += v;
+          if (id(g_cnt)[i][47] < 65535)
+            id(g_cnt)[i][47]++;
+          id(graph_redraw)->execute(i);
+
+  # Move graph i's window so slot 47 is the current half-hour.
+  - id: graph_advance
+    parameters:
+      i: int
+    then:
+      - lambda: |-
+          const auto now = id(ha_time)->now();
+          if (!now.is_valid())
+            return;
+          const int32_t h = (int32_t) (now.timestamp / 1800);
+          auto &sum = id(g_sum)[i];
+          auto &cnt = id(g_cnt)[i];
+          int32_t &head = id(g_head)[i];
+          float &carry = id(g_carry)[i];
+          // BEGIN unit store_advance
+          if (head == 0) {
+            head = h;
+          } else if (h > head) {
+            const int32_t d = std::min<int32_t>(h - head, 48);
+            for (int s = 0; s < d; s++)  // slots falling off the left edge
+              if (cnt[s] > 0)
+                carry = sum[s] / cnt[s];
+            for (int s = 0; s < 48; s++) {
+              sum[s] = s + d < 48 ? sum[s + d] : 0.0f;
+              cnt[s] = s + d < 48 ? cnt[s + d] : 0;
+            }
+            head = h;
+          }
+          // END unit store_advance
+
+  # Repaint graph i's canvas like mini-graph-card: fade fill + threshold-coloured line.
+  - id: graph_redraw
+    parameters:
+      i: int
+    then:
+      - lambda: |-
+          id(graph_advance)->execute(i);
+          lv_obj_t *const CANVAS[4] = {id(ph_graph), id(ec_graph), id(orp_graph), id(temp_graph)};
+          lv_obj_t *const cv = CANVAS[i];
+          const auto &sum = id(g_sum)[i];
+          const auto &cnt = id(g_cnt)[i];
+          const float carry = id(g_carry)[i];
+          std::array<float, 48> pts;
+          // BEGIN unit graph_points
+          float c = carry;  // empty half-hours repeat the previous point (mini-graph behaviour)
+          for (int k = 0; k < 48; k++) {
+            if (cnt[k] > 0)
+              c = sum[k] / cnt[k];
+            pts[k] = c;
+          }
+          // END unit graph_points
+          // BEGIN unit graph_band
+          constexpr uint32_t RED = 0xEF4444, AMBER = 0xF59E0B, GREEN = 0x10B981;
+          static const float TH[4][5] = {  // mini-graph color_thresholds
+              {5.0f, 5.5f, 5.8f, 6.21f, 6.51f},
+              {1000, 1800, 2000, 2501, 2701},
+              {150, 250, 300, 401, 451},
+              {12, 16, 18, 21.01f, 24.01f}};
+          static const uint32_t TH_COLOR[5] = {RED, AMBER, GREEN, AMBER, RED};
+          auto band = [&](float val) -> uint32_t {  // colour of the highest threshold <= val
+            int b = 0;
+            for (int t = 1; t < 5; t++)
+              if (val >= TH[i][t])
+                b = t;
+            return TH_COLOR[b];
+          };
+          // END unit graph_band
+          constexpr int W = 207, H = 105, PAD = 3;
+          const lv_color_t tile = lv_color_hex(0x232325);
+          lv_canvas_fill_bg(cv, tile, LV_OPA_COVER);
+          // BEGIN unit graph_range
+          float lo = INFINITY, hi = -INFINITY;
+          int first = -1;  // first non-blank point
+          for (int k = 0; k < 48; k++) {
+            if (std::isnan(pts[k]))
+              continue;
+            if (first < 0)
+              first = k;
+            lo = std::min(lo, pts[k]);
+            hi = std::max(hi, pts[k]);
+          }
+          if (first >= 0 && hi - lo < 1e-6f) {  // flat line: centre it
+            lo -= 0.5f;
+            hi += 0.5f;
+          }
+          // END unit graph_range
+          if (first < 0)
+            return;  // no data yet: plain tile
+          const float span = H - 1 - 2 * PAD;
+          auto yv = [&](float val) { return PAD + (hi - val) / (hi - lo) * span; };  // value -> y
+          auto vy = [&](float y) { return hi - (y - PAD) / span * (hi - lo); };      // y -> value
+          auto xk = [](float k) { return k * (W - 1) / 47.0f; };                      // slot -> x
+
+          // Fade fill: band colour at each height, 40% at the top fading to 6% at the bottom.
+          lv_draw_buf_t *buf = lv_canvas_get_draw_buf(cv);
+          const bool rgb565 = buf->header.cf == LV_COLOR_FORMAT_RGB565;
+          for (int x = 0; x < W; x++) {
+            const float f = x * 47.0f / (W - 1);
+            const int k = std::min(46, (int) f);
+            if (std::isnan(pts[k]) || std::isnan(pts[k + 1]))
+              continue;
+            const float val = pts[k] + (pts[k + 1] - pts[k]) * (f - k);
+            for (int y = std::max(0, (int) lroundf(yv(val))); y < H; y++) {
+              const auto a = (lv_opa_t) (255.0f * 0.4f * (1.0f - 0.85f * y / H));
+              const lv_color_t px = lv_color_mix(lv_color_hex(band(vy(y))), tile, a);
+              if (rgb565)
+                ((uint16_t *) (buf->data + y * buf->header.stride))[x] = lv_color_to_u16(px);
+              else
+                lv_canvas_set_px(cv, x, y, px, LV_OPA_COVER);
+            }
+          }
+          lv_obj_invalidate(cv);
+
+          // Line: 3 px, split wherever it crosses a threshold so colours switch exactly there.
+          lv_layer_t layer;
+          lv_canvas_init_layer(cv, &layer);
+          lv_draw_line_dsc_t dsc;
+          lv_draw_line_dsc_init(&dsc);
+          dsc.width = 3;
+          dsc.round_start = 1;
+          dsc.round_end = 1;
+          auto seg = [&](float x0, float v0, float x1, float v1) {
+            dsc.p1.x = lroundf(x0);
+            dsc.p1.y = lroundf(yv(v0));
+            dsc.p2.x = lroundf(x1);
+            dsc.p2.y = lroundf(yv(v1));
+            dsc.color = lv_color_hex(band((v0 + v1) / 2));
+            lv_draw_line(&layer, &dsc);
+          };
+          if (first == 47)  // a single point so far: short dash
+            seg(xk(47) - 1, pts[47], xk(47), pts[47]);
+          for (int k = first; k < 47; k++) {
+            const float a = pts[k], b = pts[k + 1];
+            // BEGIN unit segment_cuts
+            float cut[6] = {0.0f};  // fractions along a->b where the colour changes, framed by 0 and 1
+            int n = 1;
+            for (int t = 1; t < 5; t++) {
+              const float th = TH[i][t];
+              if ((th - a) * (th - b) < 0) {
+                const float f = (th - a) / (b - a);
+                int j = n++;
+                while (j > 1 && cut[j - 1] > f) {  // insertion sort: at most 4 crossings
+                  cut[j] = cut[j - 1];
+                  j--;
+                }
+                cut[j] = f;
+              }
+            }
+            cut[n++] = 1.0f;
+            // END unit segment_cuts
+            for (int j = 0; j + 1 < n; j++)
+              seg(xk(k + cut[j]), a + (b - a) * cut[j], xk(k + cut[j + 1]), a + (b - a) * cut[j + 1]);
+          }
+          lv_canvas_finish_layer(cv, &layer);
+
+globals:
+  # 48 half-hour slots per graph (slot 47 = the current half-hour): reading sum and count.
+  - id: g_sum
+    type: std::array<std::array<float, 48>, 4>
+  - id: g_cnt
+    type: std::array<std::array<uint16_t, 48>, 4>
+  # Half-hour number (unix time / 1800) of slot 47; 0 = not started yet.
+  - id: g_head
+    type: std::array<int32_t, 4>
+  # Value in effect before slot 0 (NaN = unknown).
+  - id: g_carry
+    type: std::array<float, 4>
+    initial_value: "std::array<float, 4>{NAN, NAN, NAN, NAN}"
+
+interval:
+  - interval: 60s
+    then:
+      - lambda: |-
+          for (int i = 0; i < 4; i++) {
+            const int32_t before = id(g_head)[i];
+            id(graph_advance)->execute(i);
+            if (id(g_head)[i] != before)
+              id(graph_redraw)->execute(i);
+          }
