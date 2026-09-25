@@ -133,19 +133,22 @@ sensor:
             return;
           }
           lv_label_set_text_fmt(id(kpi_value), "%.0f%%", x);
-          // Teardrop pointer like the HA gauge card, drawn with smooth edges into a 48x48
+          // Teardrop pointer like the HA gauge card, drawn with smooth edges into a 64x64
           // transparent patch that is moved onto the pointer's spot.
           const float v = x, cx = 159.0f, cy = 164.0f, R = 140.0f;  // gauge centre and outer radius
           // BEGIN unit pointer_geometry
           const float vc = std::min(100.0f, std::max(0.0f, v));
           const float th = 3.14159265f * (1.0f - vc / 100.0f);  // 180 degrees at 0, 0 at 100
           const float ux = cosf(th), uy = -sinf(th);            // unit vector towards the tip
-          const float hx = cx + 0.76f * R * ux, hy = cy + 0.76f * R * uy;    // head centre
-          const float tx = cx + 0.888f * R * ux, ty = cy + 0.888f * R * uy;  // tip centre
+          const float r1 = 0.046f * R, r2 = 0.0057f * R;        // head and tip radius
+          const float o = 0.016f * R;                           // outline in the background colour
+          const float rh = 0.62f * R;   // head centre: the round part stays in the dark centre
+          const float rt = 0.888f * R;  // tip centre: only the arrow reaches into the coloured band
+          const float h = rt - rh;
+          const float hx = cx + rh * ux, hy = cy + rh * uy;
+          const float tx = cx + rt * ux, ty = cy + rt * uy;
           // END unit pointer_geometry
-          constexpr int S = 48;
-          const float r1 = 0.046f * R, r2 = 0.0057f * R, h = (0.888f - 0.76f) * R;  // head, tip, length
-          const float o = 0.016f * R;  // outline in the background colour (notches the arc)
+          constexpr int S = 64;  // patch size: fits both ends, the outline and anti-aliasing
           const int x0 = (int) lroundf((hx + tx) / 2) - S / 2, y0 = (int) lroundf((hy + ty) / 2) - S / 2;
           lv_obj_set_pos(cv, x0, y0);
           lv_draw_buf_t *buf = lv_canvas_get_draw_buf(cv);
@@ -318,11 +321,11 @@ lvgl:
                   - arc: {color: 0xF59E0B, width: 43, start_value: 65, end_value: 85}
                   - arc: {color: 0x10B981, width: 43, start_value: 85, end_value: 100}
         - canvas:
-            id: kpi_pointer  # 48x48 patch moved to the pointer and redrawn on each value
+            id: kpi_pointer  # 64x64 patch moved to the pointer and redrawn on each value
             x: 0
             y: 0
-            width: 48
-            height: 48
+            width: 64
+            height: 64
             transparent: true
             hidden: true
         - label:

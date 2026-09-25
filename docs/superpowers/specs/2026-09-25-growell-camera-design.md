@@ -44,7 +44,7 @@ tap, and the gauge, graphs and touch stay responsive while pictures download.
 | Element | Geometry |
 |---|---|
 | Gauge `meter` | 280×280 at (19, 24) → centre (159, 164), arc radius 140, arc width 43 (the HA card's proportions); no line needle |
-| Gauge pointer | HA-card teardrop drawn per pixel (signed distance, anti-aliased) into a 48×48 transparent canvas moved onto the pointer: head centre 0.76 R, head radius 0.046 R, tip 0.888 R (radius 0.0057 R), fill `0xE1E1E1`, 0.016 R outline in `0x1C1C1E` that notches the arc; hidden when unavailable |
+| Gauge pointer | HA-card-style teardrop drawn per pixel (signed distance, anti-aliased) into a 64×64 transparent canvas moved onto the pointer: head centre 0.62 R (the round head and its outline stay inside the band's inner edge, r = 97), head radius 0.046 R, tip 0.888 R (radius 0.0057 R) so only the arrow enters the coloured band; fill `0xE1E1E1`, 0.016 R outline in `0x1C1C1E` that notches the arc; hidden when unavailable |
 | Gauge value | `f_gauge_value` Roboto 400 **52 px** with `%`, e.g. "87%"; label x 14 w 290, y 108, centred |
 | Gauge name | "Growell 1 Health Index", `f_note` 16 px `0xCFCFCF`, y 179, centred |
 | Picture `image` | (14, 253), 290×163, background `0x232325`, radius 12, `clip_corner`; snapshot decoded to 289×163 |

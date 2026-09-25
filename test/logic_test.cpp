@@ -432,11 +432,11 @@ static void test_jpeg_info() {
 
 // ---------------- pointer_geometry / pointer_sdf ----------------
 struct Pointer {
-  float hx, hy, tx, ty, ux, uy;
+  float hx, hy, tx, ty, ux, uy, r1, r2, o, h, rh, rt;
 };
 static Pointer pointer_geometry(float v, float cx, float cy, float R) {
 #include "build/pointer_geometry.inc"
-  return {hx, hy, tx, ty, ux, uy};
+  return {hx, hy, tx, ty, ux, uy, r1, r2, o, h, rh, rt};
 }
 
 static float pointer_sdf(float dx, float dy, float ux, float uy, float r1, float r2, float h) {
@@ -445,24 +445,32 @@ static float pointer_sdf(float dx, float dy, float ux, float uy, float r1, float
 }
 
 static void test_pointer_geometry() {
-  // Gauge centre (159, 164), outer radius 140: head at 0.76 R, tip at 0.888 R.
+  // Gauge centre (159, 164), outer radius 140, coloured band 43 px wide (inner edge at r = 97).
+  // Head centre at 0.62 R (in the dark centre), tip at 0.888 R (in the band).
   Pointer p = pointer_geometry(0, 159, 164, 140);  // 0 points left
-  CHECK_NEAR(p.hx, 159 - 106.4f);
+  CHECK_NEAR(p.hx, 159 - 86.8f);
   CHECK_NEAR(p.hy, 164);
   CHECK_NEAR(p.tx, 159 - 124.32f);
   p = pointer_geometry(50, 159, 164, 140);  // 50 points straight up (screen y grows down)
   CHECK_NEAR(p.hx, 159);
-  CHECK_NEAR(p.hy, 164 - 106.4f);
+  CHECK_NEAR(p.hy, 164 - 86.8f);
   CHECK_NEAR(p.ty, 164 - 124.32f);
   p = pointer_geometry(100, 159, 164, 140);  // 100 points right
-  CHECK_NEAR(p.hx, 159 + 106.4f);
+  CHECK_NEAR(p.hx, 159 + 86.8f);
   CHECK_NEAR(p.hy, 164);
   p = pointer_geometry(87, 159, 164, 140);  // the card's example: 23.4 degrees above the right horizon
   CHECK_NEAR(p.ux, 0.917755f);
   CHECK_NEAR(p.uy, -0.397148f);
   Pointer lo = pointer_geometry(-5, 159, 164, 140), hi = pointer_geometry(150, 159, 164, 140);
-  CHECK_NEAR(lo.hx, 159 - 106.4f);  // clamped to 0
-  CHECK_NEAR(hi.hx, 159 + 106.4f);  // clamped to 100
+  CHECK_NEAR(lo.hx, 159 - 86.8f);  // clamped to 0
+  CHECK_NEAR(hi.hx, 159 + 86.8f);  // clamped to 100
+  // The round head (with its outline) stays in the dark centre; only the arrow enters the band.
+  CHECK(p.rh + p.r1 + p.o <= 97.0f - 1.0f);
+  CHECK(p.rt - p.r2 >= 97.0f + 20.0f);  // the tip reaches well into the band ...
+  CHECK(p.rt + p.r2 + p.o <= 140.0f);   // ... but stays inside its outer edge
+  CHECK_NEAR(p.h, p.rt - p.rh);
+  // Both ends plus outline and 1 px of anti-aliasing fit the 64x64 patch centred between them.
+  CHECK(p.h / 2 + p.r1 + p.o + 1.0f <= 32.0f);
 }
 
 static void test_pointer_sdf() {
