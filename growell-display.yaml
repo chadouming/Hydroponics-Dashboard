@@ -1,0 +1,1224 @@
+# ============================================================================
+# Growell 1 display: Sunton ESP32-8048S070 (7", 800x480, ESP32-S3), ESPHome 2026.9+
+# Shows the Home Assistant "Growell 1" card: Health Index gauge plus 24 h
+# mini-graphs for pH, EC, ORP and water temperature.
+#
+# One-time setup
+#   1. Home Assistant: create a non-admin user for this display, log in as it,
+#      then Profile > Security > Long-lived access tokens > Create token.
+#   2. ESPHome Builder: New device > ESP32-S3 > Skip installation. Open its YAML
+#      and copy the generated `api: encryption: key:` value.
+#   3. ESPHome Builder > Secrets, add (wifi_ssid / wifi_password too if missing):
+#        growell_api_key: "<the key from step 2>"
+#        ha_url: "http://192.168.1.10:8123"     # your Home Assistant address
+#        ha_token: "<the token from step 1>"
+#   4. Replace the device's whole YAML with this file and Install
+#      (the first time over USB, afterwards over Wi-Fi).
+# ============================================================================
+substitutions:
+  name: growell-display
+  friendly_name: Growell Display
+  # Home Assistant entities shown on the screen
+  ent_kpi: sensor.growell_1_kpi_score
+  ent_ph: sensor.greenhouse_growell_1_ph
+  ent_ec: sensor.greenhouse_growell_1_conductivity_value
+  ent_orp: sensor.greenhouse_growell_1_orp_value
+  ent_temp: sensor.greenhouse_growell_1_temperature
+  # Cameras shown under the gauge (the ‹ › buttons step through them)
+  cam_1: camera.greenhouse_camera_tapo_cam_1_still  # Generic Camera fed by Frigate's go2rtc frame.jpeg
+  cam_1_name: Tapo cam 1
+  cam_2: camera.greenhouse_camera_tapo_cam_2_still
+  cam_2_name: Tapo cam 2
+  # Used by the history backfill (Home Assistant REST API)
+  ha_url: !secret ha_url
+  ha_token: !secret ha_token
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.9.0  # the release this file was validated and built with
+  includes:
+    - <esp_crt_bundle.h>  # system header (no extra file): CA bundle for an https:// ha_url
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          // Canvas buffers start uninitialised: paint them the tile colour.
+          for (lv_obj_t *c : {id(ph_graph), id(ec_graph), id(orp_graph), id(temp_graph)})
+            lv_canvas_fill_bg(c, lv_color_hex(0x232325), LV_OPA_COVER);
+          // Home Assistant origin for REST calls: ha_url without any path or query.
+          const std::string base = "${ha_url}";
+          // BEGIN unit ha_origin
+          std::string origin = base;
+          const size_t scheme = origin.find("://");
+          const size_t cut = origin.find_first_of("/?#", scheme == std::string::npos ? 0 : scheme + 3);
+          if (cut != std::string::npos)
+            origin.erase(cut);
+          // END unit ha_origin
+          id(g_ha_origin) = origin;
+          id(camera_service)->execute(0);  // after g_ha_origin is set
+
+esp32:
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    advanced:
+      # Run code from PSRAM so flash writes (OTA, Wi-Fi config) don't starve the panel.
+      execute_from_psram: true
+      # Headroom for drawing graphs from inside the history download handler.
+      loop_task_stack_size: 16384
+    sdkconfig_options:
+      # Bigger data cache: stops the RGB panel image from drifting under load.
+      CONFIG_ESP32S3_DATA_CACHE_64KB: y
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: y
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  hardware_uart: UART0  # the board's USB port goes through a CH340 on UART0
+
+api:
+  id: api_server
+  encryption:
+    key: !secret growell_api_key
+
+ota:
+  - platform: esphome
+
+# No fallback hotspot / captive portal on purpose: its firmware-upload page has no
+# password and this board holds a Home Assistant token. If the Wi-Fi details
+# change, update the secrets and reinstall over USB.
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+output:
+  - platform: ledc
+    id: backlight_pwm
+    pin: GPIO2
+    frequency: 1220Hz
+
+light:
+  - platform: monochromatic
+    id: backlight
+    name: Backlight
+    output: backlight_pwm
+    restore_mode: ALWAYS_ON
+
+display:
+  - platform: mipi_rgb
+    id: main_display
+    model: ESP32-8048S070
+    update_interval: never  # LVGL drives the panel
+    auto_clear_enabled: false
+
+sensor:
+  - platform: homeassistant
+    id: kpi
+    entity_id: ${ent_kpi}
+    internal: true
+    on_value:
+      - lambda: |-
+          lv_obj_t *cv = id(kpi_pointer);
+          if (std::isnan(x)) {  // unavailable / unknown
+            lv_label_set_text(id(kpi_value), "—");
+            lv_obj_add_flag(cv, LV_OBJ_FLAG_HIDDEN);
+            return;
+          }
+          lv_label_set_text_fmt(id(kpi_value), "%.0f%%", x);
+          // Teardrop pointer like the HA gauge card, drawn with smooth edges into a 64x64
+          // transparent patch that is moved onto the pointer's spot.
+          const float v = x, cx = 159.0f, cy = 164.0f, R = 140.0f;  // gauge centre and outer radius
+          // BEGIN unit pointer_geometry
+          const float vc = std::min(100.0f, std::max(0.0f, v));
+          const float th = 3.14159265f * (1.0f - vc / 100.0f);  // 180 degrees at 0, 0 at 100
+          const float ux = cosf(th), uy = -sinf(th);            // unit vector towards the tip
+          const float r1 = 0.046f * R, r2 = 0.0057f * R;        // head and tip radius
+          const float o = 0.016f * R;                           // outline in the background colour
+          const float rh = 0.62f * R;   // head centre: the round part stays in the dark centre
+          const float rt = 0.888f * R;  // tip centre: only the arrow reaches into the coloured band
+          const float h = rt - rh;
+          const float hx = cx + rh * ux, hy = cy + rh * uy;
+          const float tx = cx + rt * ux, ty = cy + rt * uy;
+          // END unit pointer_geometry
+          constexpr int S = 64;  // patch size: fits both ends, the outline and anti-aliasing
+          const int x0 = (int) lroundf((hx + tx) / 2) - S / 2, y0 = (int) lroundf((hy + ty) / 2) - S / 2;
+          lv_obj_set_pos(cv, x0, y0);
+          lv_draw_buf_t *buf = lv_canvas_get_draw_buf(cv);
+          const bool argb = buf->header.cf == LV_COLOR_FORMAT_ARGB8888;
+          const float BG[3] = {0x1C, 0x1C, 0x1E}, FG[3] = {0xE1, 0xE1, 0xE1};  // R, G, B
+          for (int py = 0; py < S; py++) {
+            for (int px = 0; px < S; px++) {
+              const float dx = x0 + px + 0.5f - hx, dy = y0 + py + 0.5f - hy;
+              // BEGIN unit pointer_sdf
+              // Signed distance from (dx, dy), relative to the head centre, to the teardrop: a circle
+              // of radius r1 joined by tangent lines to a circle of radius r2 at distance h along
+              // (ux, uy). Negative inside. (Inigo Quilez's "uneven capsule".)
+              const float ly = dx * ux + dy * uy;
+              const float lx = fabsf(-dx * uy + dy * ux);
+              const float b = (r1 - r2) / h, a = sqrtf(1.0f - b * b);
+              const float k = -b * lx + a * ly;
+              float sd;
+              if (k < 0.0f)
+                sd = sqrtf(lx * lx + ly * ly) - r1;
+              else if (k > a * h)
+                sd = sqrtf(lx * lx + (ly - h) * (ly - h)) - r2;
+              else
+                sd = lx * a + ly * b - r1;
+              // END unit pointer_sdf
+              const float fill = std::min(1.0f, std::max(0.0f, 0.5f - sd));
+              const float outl = std::min(1.0f, std::max(0.0f, 0.5f - (sd - o)));
+              const float f = outl > 0.0f ? fill / outl : 0.0f;  // fill share inside the outlined shape
+              const uint8_t r = (uint8_t) lroundf(BG[0] + (FG[0] - BG[0]) * f);
+              const uint8_t g = (uint8_t) lroundf(BG[1] + (FG[1] - BG[1]) * f);
+              const uint8_t bl = (uint8_t) lroundf(BG[2] + (FG[2] - BG[2]) * f);
+              const uint8_t al = (uint8_t) lroundf(255.0f * outl);
+              if (argb) {
+                uint8_t *p = buf->data + py * buf->header.stride + px * 4;  // B, G, R, A
+                p[0] = bl;
+                p[1] = g;
+                p[2] = r;
+                p[3] = al;
+              } else {
+                lv_canvas_set_px(cv, px, py, lv_color_make(r, g, bl), al);
+              }
+            }
+          }
+          lv_obj_invalidate(cv);
+          lv_obj_remove_flag(cv, LV_OBJ_FLAG_HIDDEN);
+  - platform: homeassistant
+    id: ph
+    entity_id: ${ent_ph}
+    internal: true
+    on_value:
+      - script.execute: {id: tile_update, i: 0, v: !lambda "return x;"}
+  - platform: homeassistant
+    id: ec
+    entity_id: ${ent_ec}
+    internal: true
+    on_value:
+      - script.execute: {id: tile_update, i: 1, v: !lambda "return x;"}
+  - platform: homeassistant
+    id: orp
+    entity_id: ${ent_orp}
+    internal: true
+    on_value:
+      - script.execute: {id: tile_update, i: 2, v: !lambda "return x;"}
+  - platform: homeassistant
+    id: temp
+    entity_id: ${ent_temp}
+    internal: true
+    on_value:
+      - script.execute: {id: tile_update, i: 3, v: !lambda "return x;"}
+
+image:
+  # Decode target for camera snapshots. The camera_service script downloads the
+  # JPEGs itself in a background task; this component never fetches its own URL.
+  - platform: online_image
+    id: cam_snapshot
+    url: "${ha_url}/api/camera_proxy/${cam_1}"
+    format: JPEG
+    type: RGB565
+    resize: 290x163
+    buffer_size: 256  # the minimum: its own downloader is never used
+
+i2c:
+  - id: touch_bus
+    sda: GPIO19
+    scl: GPIO20
+
+touchscreen:
+  - platform: gt911
+    id: touch
+    i2c_id: touch_bus
+    reset_pin: GPIO38  # no interrupt_pin: GT911 INT is not connected on the 8048S070C
+
+font:
+  - id: f_name  # tile titles, e.g. "pH (5.8 – 6.2)" (default GF_Latin_Kernel has "–")
+    file: "gfonts://Roboto@400"
+    size: 17
+    bpp: 4
+  - id: f_value  # tile values
+    file: "gfonts://Roboto@700"
+    size: 38
+    bpp: 4
+    glyphs: "0123456789.-—"
+  - id: f_unit
+    file: "gfonts://Roboto@700"
+    size: 18
+    bpp: 4
+    glyphs: "µS/cmV°C"
+  - id: f_icon  # Material Design Icons used by the HA card
+    file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/v7.4.47/fonts/materialdesignicons-webfont.ttf"
+    size: 24
+    bpp: 4
+    glyphs:
+      - "\U000F124B"  # mdi:flask-round-bottom
+      - "\U000F0241"  # mdi:flash
+      - "\U000F1855"  # mdi:water-opacity
+      - "\U000F1A80"  # mdi:thermometer-water
+  - id: f_gauge_value
+    file: "gfonts://Roboto@400"
+    size: 52
+    bpp: 4
+    glyphs: "0123456789.-—%"
+  - id: f_note
+    file: "gfonts://Roboto@400"
+    size: 16
+    bpp: 4
+
+lvgl:
+  displays: main_display
+  log_level: WARN
+  default_font: f_note
+  style_definitions:
+    - id: tile_style  # card_mod: rgba(255,255,255,.03) fill, .06 border, 16px radius
+      bg_color: 0x232325
+      bg_opa: COVER
+      border_color: 0x2A2A2C
+      border_width: 1
+      radius: 16
+      pad_all: 0
+    - id: bare_style  # invisible container
+      bg_opa: TRANSP
+      border_width: 0
+      radius: 0
+      pad_all: 0
+  pages:
+    - id: main_page
+      bg_color: 0x1C1C1E
+      bg_opa: COVER
+      pad_all: 0
+      scrollable: false
+      scrollbar_mode: "OFF"
+      widgets:
+        # ---------------- Health Index gauge (left column 14,14 290x452) ----------------
+        - meter:
+            id: kpi_meter
+            x: 19  # square 280x280, centre at (159,164), arc outer radius 140
+            y: 24
+            width: 280
+            height: 280
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            indicator:  # the pivot dot: hidden
+              bg_opa: TRANSP
+            scales:
+              - range_from: 0
+                range_to: 100
+                angle_range: 180
+                rotation: 180  # top semicircle, 0 on the left
+                indicators:  # no ticks: key => no ticks or labels; pointer drawn on kpi_pointer
+                  - arc: {color: 0xEF4444, width: 43, start_value: 0, end_value: 65}
+                  - arc: {color: 0xF59E0B, width: 43, start_value: 65, end_value: 85}
+                  - arc: {color: 0x10B981, width: 43, start_value: 85, end_value: 100}
+        - canvas:
+            id: kpi_pointer  # 64x64 patch moved to the pointer and redrawn on each value
+            x: 0
+            y: 0
+            width: 64
+            height: 64
+            transparent: true
+            hidden: true
+        - label:
+            id: kpi_value
+            x: 14
+            y: 108
+            width: 290
+            text_align: CENTER
+            text_font: f_gauge_value
+            text_color: 0xE1E1E1
+            text: "—"
+        - label:
+            x: 14
+            y: 179
+            width: 290
+            text_align: CENTER
+            text_font: f_note
+            text_color: 0xCFCFCF
+            text: "Growell 1 Health Index"
+        # ---------------- Camera (under the gauge) ----------------
+        - image:
+            id: cam_img
+            x: 14
+            y: 253
+            width: 290
+            height: 163
+            src: cam_snapshot
+            bg_color: 0x232325
+            bg_opa: COVER
+            radius: 12
+            clip_corner: true
+        - label:
+            id: cam_status  # "Loading..." / "Camera unavailable" over the picture
+            x: 14
+            y: 320
+            width: 290
+            text_align: CENTER
+            text_font: f_note
+            text_color: 0xE1E1E1
+            bg_color: 0x000000
+            bg_opa: 50%
+            pad_all: 4
+            text: "Loading..."
+        - button:
+            id: cam_prev
+            x: 14
+            y: 426
+            width: 56
+            height: 40
+            radius: 10
+            bg_color: 0x2A2A2C
+            bg_opa: COVER
+            border_width: 0
+            shadow_width: 0
+            text: "\uF053"  # LV_SYMBOL_LEFT
+            text_font: montserrat_20
+            text_color: 0xE1E1E1
+            pressed:
+              bg_color: 0x3A3A3C
+            on_click:
+              - script.execute: {id: camera_service, op: 3}
+        - button:
+            id: cam_next
+            x: 248
+            y: 426
+            width: 56
+            height: 40
+            radius: 10
+            bg_color: 0x2A2A2C
+            bg_opa: COVER
+            border_width: 0
+            shadow_width: 0
+            text: "\uF054"  # LV_SYMBOL_RIGHT
+            text_font: montserrat_20
+            text_color: 0xE1E1E1
+            pressed:
+              bg_color: 0x3A3A3C
+            on_click:
+              - script.execute: {id: camera_service, op: 2}
+        - label:
+            id: cam_name
+            x: 70
+            y: 435
+            width: 178
+            text_align: CENTER
+            text_font: f_note
+            text_color: 0x9B9B9B
+            text: "${cam_1_name}"
+        - label:
+            id: ha_note  # over the top of the picture; hidden while Home Assistant is connected
+            x: 14
+            y: 257
+            width: 290
+            text_align: CENTER
+            text_font: f_note
+            text_color: 0xF59E0B
+            bg_color: 0x000000
+            bg_opa: 50%
+            pad_all: 4
+            text: "Home Assistant disconnected"
+        # ---------------- pH tile ----------------
+        - obj:
+            styles: tile_style
+            x: 316
+            y: 14
+            width: 229
+            height: 220
+            scrollable: false
+            scrollbar_mode: "OFF"
+            widgets:
+              - label: {x: 12, y: 12, text: "pH (5.8 – 6.2)", text_font: f_name, text_color: 0x9B9B9B}
+              - label: {align: TOP_RIGHT, x: -12, y: 10, text: "\U000F124B", text_font: f_icon, text_color: 0x44739E}
+              - obj:
+                  styles: bare_style
+                  x: 12
+                  y: 40
+                  width: SIZE_CONTENT
+                  height: SIZE_CONTENT
+                  scrollable: false
+                  scrollbar_mode: "OFF"
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: END, pad_column: 6}
+                  widgets:
+                    - label: {id: ph_value, text: "—", text_font: f_value, text_color: 0x9B9B9B}
+                    - label: {id: ph_unit, text: "", text_font: f_unit, text_color: 0x9B9B9B, pad_bottom: 5}
+              - canvas: {id: ph_graph, x: 10, y: 104, width: 207, height: 105, transparent: false}
+        # ---------------- EC tile ----------------
+        - obj:
+            styles: tile_style
+            x: 557
+            y: 14
+            width: 229
+            height: 220
+            scrollable: false
+            scrollbar_mode: "OFF"
+            widgets:
+              - label: {x: 12, y: 12, text: "EC (2000 – 2500)", text_font: f_name, text_color: 0x9B9B9B}
+              - label: {align: TOP_RIGHT, x: -12, y: 10, text: "\U000F0241", text_font: f_icon, text_color: 0x44739E}
+              - obj:
+                  styles: bare_style
+                  x: 12
+                  y: 40
+                  width: SIZE_CONTENT
+                  height: SIZE_CONTENT
+                  scrollable: false
+                  scrollbar_mode: "OFF"
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: END, pad_column: 6}
+                  widgets:
+                    - label: {id: ec_value, text: "—", text_font: f_value, text_color: 0x9B9B9B}
+                    - label: {id: ec_unit, text: "µS/cm", text_font: f_unit, text_color: 0x9B9B9B, pad_bottom: 5}
+              - canvas: {id: ec_graph, x: 10, y: 104, width: 207, height: 105, transparent: false}
+        # ---------------- ORP tile ----------------
+        - obj:
+            styles: tile_style
+            x: 316
+            y: 246
+            width: 229
+            height: 220
+            scrollable: false
+            scrollbar_mode: "OFF"
+            widgets:
+              - label: {x: 12, y: 12, text: "ORP (300 – 400)", text_font: f_name, text_color: 0x9B9B9B}
+              - label: {align: TOP_RIGHT, x: -12, y: 10, text: "\U000F1855", text_font: f_icon, text_color: 0x44739E}
+              - obj:
+                  styles: bare_style
+                  x: 12
+                  y: 40
+                  width: SIZE_CONTENT
+                  height: SIZE_CONTENT
+                  scrollable: false
+                  scrollbar_mode: "OFF"
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: END, pad_column: 6}
+                  widgets:
+                    - label: {id: orp_value, text: "—", text_font: f_value, text_color: 0x9B9B9B}
+                    - label: {id: orp_unit, text: "mV", text_font: f_unit, text_color: 0x9B9B9B, pad_bottom: 5}
+              - canvas: {id: orp_graph, x: 10, y: 104, width: 207, height: 105, transparent: false}
+        # ---------------- Temp tile ----------------
+        - obj:
+            styles: tile_style
+            x: 557
+            y: 246
+            width: 229
+            height: 220
+            scrollable: false
+            scrollbar_mode: "OFF"
+            widgets:
+              - label: {x: 12, y: 12, text: "Temp (18 – 21)", text_font: f_name, text_color: 0x9B9B9B}
+              - label: {align: TOP_RIGHT, x: -12, y: 10, text: "\U000F1A80", text_font: f_icon, text_color: 0x44739E}
+              - obj:
+                  styles: bare_style
+                  x: 12
+                  y: 40
+                  width: SIZE_CONTENT
+                  height: SIZE_CONTENT
+                  scrollable: false
+                  scrollbar_mode: "OFF"
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: END, pad_column: 6}
+                  widgets:
+                    - label: {id: temp_value, text: "—", text_font: f_value, text_color: 0x9B9B9B}
+                    - label: {id: temp_unit, text: "°C", text_font: f_unit, text_color: 0x9B9B9B, pad_bottom: 5}
+              - canvas: {id: temp_graph, x: 10, y: 104, width: 207, height: 105, transparent: false}
+
+script:
+  # New reading for tile i (0 pH, 1 EC, 2 ORP, 3 Temp): value text + colour, then history.
+  - id: tile_update
+    parameters:
+      i: int
+      v: float
+    then:
+      - lambda: |-
+          lv_obj_t *const VALUE[4] = {id(ph_value), id(ec_value), id(orp_value), id(temp_value)};
+          lv_obj_t *const UNIT[4] = {id(ph_unit), id(ec_unit), id(orp_unit), id(temp_unit)};
+          static const char *const FORMAT[4] = {"%.2f", "%.0f", "%.0f", "%.1f"};
+          // card_mod colour rules: green lo, green hi, amber lo, amber hi
+          static const float LIMITS[4][4] = {
+              {5.8f, 6.2f, 5.5f, 6.5f}, {2000, 2500, 1800, 2700}, {300, 400, 250, 450}, {18, 21, 16, 24}};
+          const float gLo = LIMITS[i][0], gHi = LIMITS[i][1], aLo = LIMITS[i][2], aHi = LIMITS[i][3];
+          uint32_t col;
+          // BEGIN unit value_color
+          constexpr uint32_t GREY = 0x9B9B9B, RED = 0xEF4444, AMBER = 0xF59E0B, GREEN = 0x10B981;
+          if (std::isnan(v))
+            col = GREY;
+          else if (v >= gLo && v <= gHi)
+            col = GREEN;
+          else if ((v >= aLo && v < gLo) || (v > gHi && v <= aHi))
+            col = AMBER;
+          else
+            col = RED;
+          // END unit value_color
+          if (std::isnan(v))
+            lv_label_set_text(VALUE[i], "—");
+          else
+            lv_label_set_text_fmt(VALUE[i], FORMAT[i], v);
+          lv_obj_set_style_text_color(VALUE[i], lv_color_hex(col), LV_PART_MAIN);
+          lv_obj_set_style_text_color(UNIT[i], lv_color_hex(col), LV_PART_MAIN);
+
+          // History: only real readings, and only once the clock is set.
+          // BEGIN unit live_sample
+          const bool keep = std::isfinite(v);  // NaN = unavailable; inf would wreck the y-range
+          // END unit live_sample
+          if (!keep || !id(ha_time)->now().is_valid())
+            return;
+          id(graph_advance)->execute(i);
+          id(g_sum)[i][47] += v;
+          if (id(g_cnt)[i][47] < 65535)
+            id(g_cnt)[i][47]++;
+          id(graph_redraw)->execute(i);
+
+  # Move graph i's window so slot 47 is the current half-hour.
+  - id: graph_advance
+    parameters:
+      i: int
+    then:
+      - lambda: |-
+          const auto now = id(ha_time)->now();
+          if (!now.is_valid())
+            return;
+          const int32_t h = (int32_t) (now.timestamp / 1800);
+          auto &sum = id(g_sum)[i];
+          auto &cnt = id(g_cnt)[i];
+          int32_t &head = id(g_head)[i];
+          float &carry = id(g_carry)[i];
+          // BEGIN unit store_advance
+          if (head == 0) {
+            head = h;
+          } else if (h > head) {
+            const int32_t d = std::min<int32_t>(h - head, 48);
+            for (int s = 0; s < d; s++)  // slots falling off the left edge
+              if (cnt[s] > 0)
+                carry = sum[s] / cnt[s];
+            for (int s = 0; s < 48; s++) {
+              sum[s] = s + d < 48 ? sum[s + d] : 0.0f;
+              cnt[s] = s + d < 48 ? cnt[s + d] : 0;
+            }
+            head = h;
+          }
+          // END unit store_advance
+
+  # Repaint graph i's canvas like mini-graph-card: fade fill + threshold-coloured line.
+  - id: graph_redraw
+    parameters:
+      i: int
+    then:
+      - lambda: |-
+          id(graph_advance)->execute(i);
+          lv_obj_t *const CANVAS[4] = {id(ph_graph), id(ec_graph), id(orp_graph), id(temp_graph)};
+          lv_obj_t *const cv = CANVAS[i];
+          const auto &sum = id(g_sum)[i];
+          const auto &cnt = id(g_cnt)[i];
+          const float carry = id(g_carry)[i];
+          std::array<float, 48> pts;
+          // BEGIN unit graph_points
+          float c = carry;  // empty half-hours repeat the previous point (mini-graph behaviour)
+          for (int k = 0; k < 48; k++) {
+            if (cnt[k] > 0)
+              c = sum[k] / cnt[k];
+            pts[k] = c;
+          }
+          // END unit graph_points
+          // BEGIN unit graph_band
+          constexpr uint32_t RED = 0xEF4444, AMBER = 0xF59E0B, GREEN = 0x10B981;
+          static const float TH[4][5] = {  // mini-graph color_thresholds
+              {5.0f, 5.5f, 5.8f, 6.21f, 6.51f},
+              {1000, 1800, 2000, 2501, 2701},
+              {150, 250, 300, 401, 451},
+              {12, 16, 18, 21.01f, 24.01f}};
+          static const uint32_t TH_COLOR[5] = {RED, AMBER, GREEN, AMBER, RED};
+          auto band = [&](float val) -> uint32_t {  // colour of the highest threshold <= val
+            int b = 0;
+            for (int t = 1; t < 5; t++)
+              if (val >= TH[i][t])
+                b = t;
+            return TH_COLOR[b];
+          };
+          // END unit graph_band
+          constexpr int W = 207, H = 105, PAD = 3;
+          const lv_color_t tile = lv_color_hex(0x232325);
+          lv_canvas_fill_bg(cv, tile, LV_OPA_COVER);
+          // BEGIN unit graph_range
+          float lo = INFINITY, hi = -INFINITY;
+          int first = -1;  // first non-blank point
+          for (int k = 0; k < 48; k++) {
+            if (std::isnan(pts[k]))
+              continue;
+            if (first < 0)
+              first = k;
+            lo = std::min(lo, pts[k]);
+            hi = std::max(hi, pts[k]);
+          }
+          if (first >= 0 && hi - lo < 1e-6f) {  // flat line: centre it
+            lo -= 0.5f;
+            hi += 0.5f;
+          }
+          // END unit graph_range
+          if (first < 0)
+            return;  // no data yet: plain tile
+          const float span = H - 1 - 2 * PAD;
+          auto yv = [&](float val) { return PAD + (hi - val) / (hi - lo) * span; };  // value -> y
+          auto vy = [&](float y) { return hi - (y - PAD) / span * (hi - lo); };      // y -> value
+          auto xk = [](float k) { return k * (W - 1) / 47.0f; };                      // slot -> x
+
+          // Fade fill: band colour at each height, 40% at the top fading to 6% at the bottom.
+          lv_draw_buf_t *buf = lv_canvas_get_draw_buf(cv);
+          const bool rgb565 = buf->header.cf == LV_COLOR_FORMAT_RGB565;
+          for (int x = 0; x < W; x++) {
+            const float f = x * 47.0f / (W - 1);
+            const int k = std::min(46, (int) f);
+            if (std::isnan(pts[k]) || std::isnan(pts[k + 1]))
+              continue;
+            const float val = pts[k] + (pts[k + 1] - pts[k]) * (f - k);
+            for (int y = std::max(0, (int) lroundf(yv(val))); y < H; y++) {
+              const auto a = (lv_opa_t) (255.0f * 0.4f * (1.0f - 0.85f * y / H));
+              const lv_color_t px = lv_color_mix(lv_color_hex(band(vy(y))), tile, a);
+              if (rgb565)
+                ((uint16_t *) (buf->data + y * buf->header.stride))[x] = lv_color_to_u16(px);
+              else
+                lv_canvas_set_px(cv, x, y, px, LV_OPA_COVER);
+            }
+          }
+          lv_obj_invalidate(cv);
+
+          // Line: 3 px, split wherever it crosses a threshold so colours switch exactly there.
+          lv_layer_t layer;
+          lv_canvas_init_layer(cv, &layer);
+          lv_draw_line_dsc_t dsc;
+          lv_draw_line_dsc_init(&dsc);
+          dsc.width = 3;
+          dsc.round_start = 1;
+          dsc.round_end = 1;
+          auto seg = [&](float x0, float v0, float x1, float v1) {
+            dsc.p1.x = lroundf(x0);
+            dsc.p1.y = lroundf(yv(v0));
+            dsc.p2.x = lroundf(x1);
+            dsc.p2.y = lroundf(yv(v1));
+            dsc.color = lv_color_hex(band((v0 + v1) / 2));
+            lv_draw_line(&layer, &dsc);
+          };
+          if (first == 47)  // a single point so far: short dash
+            seg(xk(47) - 1, pts[47], xk(47), pts[47]);
+          for (int k = first; k < 47; k++) {
+            const float a = pts[k], b = pts[k + 1];
+            // BEGIN unit segment_cuts
+            float cut[6] = {0.0f};  // fractions along a->b where the colour changes, framed by 0 and 1
+            int n = 1;
+            for (int t = 1; t < 5; t++) {
+              const float th = TH[i][t];
+              if ((th - a) * (th - b) < 0) {
+                const float f = (th - a) / (b - a);
+                int j = n++;
+                while (j > 1 && cut[j - 1] > f) {  // insertion sort: at most 4 crossings
+                  cut[j] = cut[j - 1];
+                  j--;
+                }
+                cut[j] = f;
+              }
+            }
+            cut[n++] = 1.0f;
+            // END unit segment_cuts
+            for (int j = 0; j + 1 < n; j++)
+              seg(xk(k + cut[j]), a + (b - a) * cut[j], xk(k + cut[j + 1]), a + (b - a) * cut[j + 1]);
+          }
+          lv_canvas_finish_layer(cv, &layer);
+
+  # Rebuild each graph that isn't synced yet from HA's last 24 h of history.
+  - id: backfill_all
+    then:
+      - repeat:
+          count: 4
+          then:
+            - if:
+                condition:
+                  lambda: "return (id(g_bf_ok) & (1 << iteration)) == 0;"
+                then:
+                  - http_request.get:
+                      url: !lambda |-
+                        static const char *const ENTITY[4] = {"${ent_ph}", "${ent_ec}", "${ent_orp}", "${ent_temp}"};
+                        const std::string &origin = id(g_ha_origin);
+                        const char *entity = ENTITY[iteration];
+                        // BEGIN unit history_url
+                        std::string url = origin;
+                        url += "/api/history/period?filter_entity_id=";
+                        url += entity;
+                        url += "&minimal_response&no_attributes";  // default window: last 24 h
+                        // END unit history_url
+                        return url;
+                      request_headers:
+                        Authorization: "Bearer ${ha_token}"
+                      capture_response: false  # we stream the body ourselves
+                      on_response:
+                        then:
+                          - lambda: |-
+                              const int i = iteration;
+                              if (response->status_code != 200) {
+                                ESP_LOGW("growell", "History %d: HTTP %d%s", i, response->status_code,
+                                         response->status_code == 401 || response->status_code == 403
+                                             ? " - check the ha_token secret" : "");
+                                return;
+                              }
+                              const auto now = id(ha_time)->now();
+                              if (!now.is_valid())
+                                return;
+                              const int32_t h_now = (int32_t) (now.timestamp / 1800);
+                              std::array<float, 48> sum{};
+                              std::array<uint16_t, 48> cnt{};
+                              float carry = NAN;
+                              // BEGIN unit backfill_accumulate
+                              auto add_sample = [&](int64_t t, float v) {
+                                int32_t k = (int32_t) (t / 1800) - (h_now - 47);
+                                if (k < 0) {  // before the window: only sets the starting value
+                                  carry = v;
+                                  return;
+                                }
+                                if (k > 47)  // HA clock slightly ahead of ours
+                                  k = 47;
+                                sum[k] += v;
+                                if (cnt[k] < 65535)
+                                  cnt[k]++;
+                              };
+                              // END unit backfill_accumulate
+                              // BEGIN unit hist_parser
+                              // Streams HA's minimal history JSON:
+                              //   [[{..."state":"6.1",...,"last_changed":"2026-09-24T10:00:00+00:00",...},
+                              //     {"state":"6.2","last_changed":"..."}, ...]]
+                              // and reports each numeric (timestamp, value) pair. `done` = the JSON closed.
+                              struct HistParser {
+                                std::function<void(int64_t, float)> on_sample;
+                                bool done = false;
+                                bool started = false;  // saw the opening '['
+                                bool bad = false;      // not a JSON array (e.g. an HTML page): never done
+                                unsigned samples = 0;
+                                int depth = 0;
+                                bool in_str = false, esc = false;
+                                int m_state = 0, m_changed = 0;  // progress through the two keys
+                                int mode = 0;                     // 0 scan, 1 state value, 2 timestamp value
+                                char val[40];
+                                int len = 0;
+                                bool have_state = false;
+                                float state = 0;
+
+                                static int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {
+                                  y -= m <= 2;
+                                  const int64_t era = (y >= 0 ? y : y - 399) / 400;
+                                  const unsigned yoe = (unsigned) (y - era * 400);
+                                  const unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+                                  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+                                  return era * 146097 + (int64_t) doe - 719468;
+                                }
+                                // "2026-09-24T22:15:00[.ffffff][+hh:mm|-hh:mm|Z]" -> unix seconds
+                                static bool parse_iso(const char *s, int64_t &out) {
+                                  int y, mo, d, hh, mi, ss, n = 0;
+                                  if (sscanf(s, "%4d-%2d-%2dT%2d:%2d:%2d%n", &y, &mo, &d, &hh, &mi, &ss, &n) != 6 ||
+                                      n != 19)
+                                    return false;
+                                  const char *p = s + n;
+                                  if (*p == '.') {
+                                    p++;
+                                    while (*p >= '0' && *p <= '9')
+                                      p++;
+                                  }
+                                  int off = 0;
+                                  if (*p == '+' || *p == '-') {
+                                    int oh, om, m2 = 0;
+                                    if (sscanf(p + 1, "%2d:%2d%n", &oh, &om, &m2) != 2 || m2 != 5)
+                                      return false;
+                                    off = (oh * 60 + om) * 60 * (*p == '-' ? -1 : 1);
+                                    p += 6;
+                                  } else if (*p == 'Z') {
+                                    p++;
+                                  }
+                                  if (*p != '\0' || mo < 1 || mo > 12 || d < 1 || d > 31)
+                                    return false;
+                                  out = days_from_civil(y, mo, d) * 86400 + hh * 3600 + mi * 60 + ss - off;
+                                  return true;
+                                }
+                                void feed(const char *p, size_t n) {
+                                  const char *const K_STATE = "\"state\":\"";
+                                  const char *const K_CHANGED = "\"last_changed\":\"";
+                                  for (size_t j = 0; j < n && !done && !bad; j++) {
+                                    const char c = p[j];
+                                    if (!started) {
+                                      if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+                                        continue;
+                                      bad = c != '[';  // HA's history is always an array of arrays
+                                      started = true;
+                                      if (bad)
+                                        break;
+                                    }
+                                    if (mode != 0) {  // inside a value we want
+                                      if (c != '"') {
+                                        if (len < (int) sizeof(val) - 1)
+                                          val[len++] = c;
+                                        continue;
+                                      }
+                                      val[len] = '\0';
+                                      in_str = false;  // this quote closes the value string
+                                      if (mode == 1) {
+                                        char *end;
+                                        state = strtof(val, &end);
+                                        have_state = end != val && *end == '\0' && std::isfinite(state);
+                                      } else {
+                                        int64_t t;
+                                        if (have_state && parse_iso(val, t)) {
+                                          on_sample(t, state);
+                                          samples++;
+                                        }
+                                        have_state = false;
+                                      }
+                                      mode = 0;
+                                      continue;
+                                    }
+                                    // Track brackets outside strings to know when the document ends.
+                                    if (in_str) {
+                                      if (esc)
+                                        esc = false;
+                                      else if (c == '\\')
+                                        esc = true;
+                                      else if (c == '"')
+                                        in_str = false;
+                                    } else if (c == '"') {
+                                      in_str = true;
+                                    } else if (c == '[' || c == '{') {
+                                      depth++;
+                                    } else if (c == ']' || c == '}') {
+                                      if (--depth == 0)
+                                        done = true;
+                                    }
+                                    m_state = c == K_STATE[m_state] ? m_state + 1 : (c == K_STATE[0] ? 1 : 0);
+                                    m_changed = c == K_CHANGED[m_changed] ? m_changed + 1 : (c == K_CHANGED[0] ? 1 : 0);
+                                    if (K_STATE[m_state] == '\0') {
+                                      mode = 1;
+                                      len = 0;
+                                      have_state = false;
+                                      m_state = m_changed = 0;
+                                    } else if (K_CHANGED[m_changed] == '\0') {
+                                      mode = 2;
+                                      len = 0;
+                                      m_state = m_changed = 0;
+                                    }
+                                  }
+                                }
+                              };
+                              // END unit hist_parser
+                              HistParser parser;
+                              parser.on_sample = add_sample;
+                              uint8_t chunk[512];
+                              uint32_t last_data = millis();
+                              while (!parser.done && !parser.bad) {
+                                const int n = response->read(chunk, sizeof(chunk));
+                                if (n > 0) {
+                                  parser.feed((const char *) chunk, n);
+                                  last_data = millis();
+                                } else if (n < 0 || response->is_read_complete() || millis() - last_data > 10000) {
+                                  break;
+                                } else {
+                                  delay(1);
+                                }
+                                App.feed_wdt();
+                              }
+                              if (parser.bad) {
+                                ESP_LOGW("growell", "History %d: reply is not Home Assistant history - check ha_url", i);
+                                return;
+                              }
+                              if (!parser.done) {
+                                ESP_LOGW("growell", "History %d: incomplete response (%u bytes), will retry", i,
+                                         (unsigned) response->get_bytes_read());
+                                return;
+                              }
+                              id(g_sum)[i] = sum;
+                              id(g_cnt)[i] = cnt;
+                              id(g_carry)[i] = carry;
+                              id(g_head)[i] = h_now;
+                              id(g_bf_ok) |= (uint8_t) (1 << i);
+                              ESP_LOGI("growell", "History %d: %u samples", i, parser.samples);
+                              id(graph_redraw)->execute(i);
+                      on_error:
+                        then:
+                          - logger.log:
+                              format: "History %u: request failed - is ha_url reachable from the display?"
+                              args: ["(unsigned) iteration"]
+      - lambda: "id(g_bf_next) = millis() + 300000;  // retry any failures in 5 min"
+
+  # Camera under the gauge. op: 0 start (boot), 1 poll (every 100 ms), 2 next, 3 previous.
+  # A background task downloads snapshots; this lambda (main loop) decodes and shows them.
+  - id: camera_service
+    parameters:
+      op: int
+    then:
+      - lambda: |-
+          static const char *const CAM[] = {"${cam_1}", "${cam_2}"};
+          static const char *const CAM_NAME[] = {"${cam_1_name}", "${cam_2_name}"};
+          constexpr int N = sizeof(CAM) / sizeof(CAM[0]);
+          constexpr size_t CAP = 256 * 1024;  // snapshot buffer (HA scales to ~320x180, ~10-35 KB)
+          enum : int { IDLE = 0, READY = 1, FAILED = 2 };
+          struct Shared {                      // main loop <-> download task
+            std::atomic<int> want{0};          // selected camera index
+            std::atomic<bool> ha_up{false};    // mirror of g_ha_up
+            std::atomic<bool> auth_failed{false};
+            std::atomic<int> state{IDLE};      // task sets READY/FAILED; the poll resets it to IDLE
+            int cam = 0;                       // camera the result belongs to
+            int http = 0;                      // HTTP status; 0 = network error, -1 = too large
+            size_t len = 0;                    // JPEG bytes in buf when READY
+            uint8_t *buf = nullptr;
+            std::string origin;                // Home Assistant origin, fixed before the task starts
+          };
+          static Shared s;
+          static TaskHandle_t task = nullptr;
+
+          if (op == 0) {  // start: allocate the buffer and launch the download task (once)
+            if (task != nullptr)
+              return;
+            s.buf = (uint8_t *) heap_caps_malloc(CAP, MALLOC_CAP_SPIRAM);
+            if (s.buf == nullptr) {
+              ESP_LOGE("camera", "No PSRAM for the snapshot buffer; camera disabled");
+              return;
+            }
+            s.origin = id(g_ha_origin);
+            xTaskCreatePinnedToCore(
+                [](void *) {
+                  for (;;) {
+                    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));  // every 5 s, or sooner when woken
+                    while (s.state.load() != IDLE)                 // previous result not consumed yet
+                      vTaskDelay(pdMS_TO_TICKS(50));
+                    if (!s.ha_up.load() || s.auth_failed.load())
+                      continue;
+                    const int cam = s.want.load();
+                    const std::string &origin = s.origin;
+                    const char *entity = CAM[cam];
+                    // BEGIN unit camera_url
+                    std::string url = origin;
+                    url += "/api/camera_proxy/";
+                    url += entity;
+                    url += "?width=320&height=180";  // HA shrinks the JPEG server-side (aspect kept)
+                    // END unit camera_url
+                    esp_http_client_config_t cfg = {};
+                    cfg.url = url.c_str();
+                    cfg.timeout_ms = 10000;
+                    cfg.crt_bundle_attach = esp_crt_bundle_attach;  // lets an https:// ha_url verify
+                    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+                    int status = -1;   // HTTP status as esp_http_client reports it (-1 = no response)
+                    int64_t n = -1;    // Content-Length (0 = unknown/chunked, < 0 = error)
+                    size_t got = 0;
+                    bool read_error = false, overflow = false, complete = false;
+                    if (c != nullptr) {
+                      esp_http_client_set_header(c, "Authorization", "Bearer ${ha_token}");
+                      if (esp_http_client_open(c, 0) == ESP_OK) {
+                        n = esp_http_client_fetch_headers(c);
+                        status = esp_http_client_get_status_code(c);
+                        if (status == 200 && n >= 0 && n <= (int64_t) CAP) {  // too-large bodies aren't read
+                          const size_t want = n > 0 ? (size_t) n : CAP;       // unknown length: up to the buffer
+                          while (got < want) {
+                            const int r = esp_http_client_read(c, (char *) s.buf + got, want - got);
+                            if (r < 0) {
+                              read_error = true;
+                              break;
+                            }
+                            if (r == 0)
+                              break;
+                            got += r;
+                          }
+                          complete = esp_http_client_is_complete_data_received(c);
+                          overflow = n == 0 && got == CAP && !complete;
+                        }
+                      }
+                      esp_http_client_cleanup(c);
+                    }
+                    // BEGIN unit fetch_result
+                    // http: the real HTTP status (>= 100); 0 = no or partial response; -1 = snapshot too large.
+                    int http = status >= 100 ? status : 0;  // esp_http_client reports -1 until a response arrives
+                    if (http == 200) {
+                      if (n > (int64_t) CAP || overflow)
+                        http = -1;
+                      else if (n < 0 || read_error || got == 0 || (n > 0 && got != (size_t) n) || (n == 0 && !complete))
+                        http = 0;
+                    }
+                    // END unit fetch_result
+                    if (http == 401 || http == 403)
+                      s.auth_failed.store(true);
+                    s.cam = cam;
+                    s.http = http;
+                    s.len = got;
+                    s.state.store(http == 200 ? READY : FAILED);
+                  }
+                },
+                "cam_dl", 12288, nullptr, 1, &task, 0);  // 12 KB: room for a TLS handshake
+            return;
+          }
+
+          if (op == 1) {  // poll: show a finished download, or report why it failed
+            if (task == nullptr)
+              return;
+            const bool up = id(g_ha_up);
+            if (up && !s.ha_up.load())  // fresh HA connection: allow the token to be tried again
+              s.auth_failed.store(false);
+            s.ha_up.store(up);
+            const int st = s.state.load();
+            if (st == IDLE)
+              return;
+            if (s.cam == s.want.load()) {  // results for a camera the user left are discarded
+              bool shown = false;
+              if (st == READY) {
+                const uint8_t *buf = s.buf;
+                const size_t len = s.len;
+                // BEGIN unit jpeg_info
+                // Frame size from the JPEG header (SOFn marker), before committing to a decode.
+                int jw = 0, jh = 0;
+                bool found = false, progressive = false;
+                if (len >= 4 && buf[0] == 0xFF && buf[1] == 0xD8) {
+                  size_t i = 2;
+                  while (i + 4 <= len && !found) {
+                    if (buf[i] != 0xFF)
+                      break;  // not at a marker: corrupt
+                    const uint8_t m = buf[i + 1];
+                    if (m == 0xFF) {  // fill byte
+                      i++;
+                      continue;
+                    }
+                    if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+                      if (i + 9 > len)
+                        break;
+                      jh = (buf[i + 5] << 8) | buf[i + 6];
+                      jw = (buf[i + 7] << 8) | buf[i + 8];
+                      progressive = m == 0xC2 || m == 0xC6 || m == 0xCA || m == 0xCE;
+                      found = true;
+                    } else {
+                      i += 2 + (((size_t) buf[i + 2] << 8) | buf[i + 3]);
+                    }
+                  }
+                }
+                // END unit jpeg_info
+                if (!found || progressive) {
+                  ESP_LOGW("camera", "%s: %s", CAM[s.cam], found ? "progressive JPEG is not supported" : "reply is not a JPEG");
+                } else if (jw * jh > 640 * 360) {  // unscaled frame: decoding it would stall the screen for seconds
+                  ESP_LOGW("camera", "%s: HA sent a %dx%d snapshot instead of ~320x180 (can HA scale camera images?)",
+                           CAM[s.cam], jw, jh);
+                } else {
+                  auto *img = id(cam_snapshot);
+                  if (img->begin_decode(s.len, esphome::runtime_image::JPEG)) {
+                    size_t off = 0;
+                    bool fed = true;
+                    while (off < s.len) {  // success = every byte consumed (end_decode alone doesn't say)
+                      const int used = img->feed_data(s.buf + off, s.len - off);
+                      if (used <= 0) {
+                        fed = false;
+                        break;
+                      }
+                      off += used;
+                    }
+                    shown = fed && img->end_decode();
+                    if (!shown)
+                      img->release();  // drop the half-painted buffer and close the session
+                  }
+                  if (shown) {
+                    lv_image_set_src(id(cam_img), img->get_lv_image_dsc());
+                    lv_obj_add_flag(id(cam_status), LV_OBJ_FLAG_HIDDEN);
+                  } else {
+                    lv_image_set_src(id(cam_img), (const void *) nullptr);  // never leave LVGL on a released buffer
+                    ESP_LOGW("camera", "%s: snapshot could not be decoded (corrupt JPEG?)", CAM[s.cam]);
+                  }
+                }
+              } else if (s.http == 401 || s.http == 403) {
+                ESP_LOGW("camera", "%s: HTTP %d - check the ha_token secret; paused until HA reconnects",
+                         CAM[s.cam], s.http);
+              } else if (s.http == -1) {
+                ESP_LOGW("camera", "%s: snapshot larger than %u KB", CAM[s.cam], (unsigned) (CAP / 1024));
+              } else {
+                ESP_LOGW("camera", "%s: snapshot failed (HTTP %d; 0 = network error or timeout)", CAM[s.cam], s.http);
+              }
+              if (!shown) {
+                lv_label_set_text(id(cam_status), "Camera unavailable");
+                lv_obj_remove_flag(id(cam_status), LV_OBJ_FLAG_HIDDEN);
+              }
+            }
+            s.state.store(IDLE);
+            return;
+          }
+
+          // op 2 / 3: next / previous camera
+          const int cur = s.want.load();
+          const int dir = op == 2 ? 1 : -1;
+          const int n = N;
+          // BEGIN unit camera_step
+          const int next = ((cur + dir) % n + n) % n;
+          // END unit camera_step
+          s.want.store(next);
+          lv_image_set_src(id(cam_img), (const void *) nullptr);  // never show the old camera under the new name
+          lv_label_set_text(id(cam_name), CAM_NAME[next]);
+          lv_label_set_text(id(cam_status), "Loading...");
+          lv_obj_remove_flag(id(cam_status), LV_OBJ_FLAG_HIDDEN);
+          if (task != nullptr)
+            xTaskNotifyGive(task);  // fetch the new camera now, not at the next 5 s tick
+
+globals:
+  # 48 half-hour slots per graph (slot 47 = the current half-hour): reading sum and count.
+  - id: g_sum
+    type: std::array<std::array<float, 48>, 4>
+  - id: g_cnt
+    type: std::array<std::array<uint16_t, 48>, 4>
+  # Half-hour number (unix time / 1800) of slot 47; 0 = not started yet.
+  - id: g_head
+    type: std::array<int32_t, 4>
+  # Value in effect before slot 0 (NaN = unknown).
+  - id: g_carry
+    type: std::array<float, 4>
+    initial_value: "std::array<float, 4>{NAN, NAN, NAN, NAN}"
+  # Backfill bookkeeping: bit i set = graph i rebuilt from HA on this connection.
+  - id: g_bf_ok
+    type: uint8_t
+    initial_value: "0"
+  - id: g_ha_up
+    type: bool
+    initial_value: "false"
+  # millis() at which the next backfill attempt may start.
+  - id: g_bf_next
+    type: uint32_t
+    initial_value: "0"
+  # Home Assistant origin (scheme://host:port), derived from ha_url at boot.
+  - id: g_ha_origin
+    type: std::string
+
+interval:
+  - interval: 60s
+    then:
+      - lambda: |-
+          for (int i = 0; i < 4; i++) {
+            const int32_t before = id(g_head)[i];
+            id(graph_advance)->execute(i);
+            if (id(g_head)[i] != before)
+              id(graph_redraw)->execute(i);
+          }
+  - interval: 2s
+    then:
+      - lambda: |-
+          // Home Assistant = an API client subscribed to states.
+          const bool up = id(api_server)->is_connected_with_state_subscription();
+          if (up != id(g_ha_up)) {
+            id(g_ha_up) = up;
+            if (up) {
+              lv_obj_add_flag(id(ha_note), LV_OBJ_FLAG_HIDDEN);
+              id(g_bf_ok) = 0;                  // re-sync every graph after each (re)connect
+              id(g_bf_next) = millis() + 3000;  // give HA a moment to send time and states
+            } else {
+              lv_obj_remove_flag(id(ha_note), LV_OBJ_FLAG_HIDDEN);
+            }
+          }
+      - if:
+          condition:
+            lambda: |-
+              return id(g_ha_up) && id(g_bf_ok) != 0x0F && id(ha_time)->now().is_valid() &&
+                     (int32_t) (millis() - id(g_bf_next)) >= 0;
+          then:
+            - script.execute: backfill_all
+  - interval: 100ms
+    then:
+      - script.execute: {id: camera_service, op: 1}
+
+http_request:
+  timeout: 10s  # HA history queries can take a few seconds
