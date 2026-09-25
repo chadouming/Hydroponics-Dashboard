@@ -346,6 +346,28 @@ static void test_backfill_accumulate() {
   CHECK(r.first == 0 && r.hi > r.lo);
 }
 
+// ---------------- camera_step / camera_url ----------------
+static int camera_step(int cur, int dir, int n) {
+#include "build/camera_step.inc"
+  return next;
+}
+
+static std::string camera_url(const std::string &origin, const char *entity) {
+#include "build/camera_url.inc"
+  return url;
+}
+
+static void test_camera() {
+  CHECK(camera_step(0, +1, 2) == 1);
+  CHECK(camera_step(1, +1, 2) == 0);  // › on the last camera wraps to the first
+  CHECK(camera_step(0, -1, 2) == 1);  // ‹ on the first wraps to the last
+  CHECK(camera_step(2, +1, 3) == 0);  // a third camera added later
+  CHECK(camera_step(0, -1, 3) == 2);
+  CHECK(camera_step(1, -1, 3) == 0);
+  CHECK(camera_url("http://ha:8123", "camera.tapo_cam_1") ==
+        "http://ha:8123/api/camera_proxy/camera.tapo_cam_1?width=320&height=180");
+}
+
 int main() {
   test_value_color();
   test_live_sample();
@@ -358,6 +380,7 @@ int main() {
   test_parse_iso();
   test_parser();
   test_backfill_accumulate();
+  test_camera();
   std::printf("%d checks, %d failures\n", checks, failures);
   return failures == 0 ? 0 : 1;
 }
