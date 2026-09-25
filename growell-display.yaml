@@ -24,6 +24,11 @@ substitutions:
   ent_ec: sensor.greenhouse_growell_1_conductivity_value
   ent_orp: sensor.greenhouse_growell_1_orp_value
   ent_temp: sensor.greenhouse_growell_1_temperature
+  # Cameras shown under the gauge (the ‹ › buttons step through them)
+  cam_1: camera.tapo_cam_1
+  cam_1_name: Tapo cam 1
+  cam_2: camera.tapo_cam_2
+  cam_2_name: Tapo cam 2
   # Used by the history backfill (Home Assistant REST API)
   ha_url: !secret ha_url
   ha_token: !secret ha_token
@@ -152,6 +157,28 @@ sensor:
     on_value:
       - script.execute: {id: tile_update, i: 3, v: !lambda "return x;"}
 
+image:
+  # Decode target for camera snapshots. The camera_service script downloads the
+  # JPEGs itself in a background task; this component never fetches its own URL.
+  - platform: online_image
+    id: cam_snapshot
+    url: "${ha_url}/api/camera_proxy/${cam_1}"
+    format: JPEG
+    type: RGB565
+    resize: 290x163
+    buffer_size: 256  # the minimum: its own downloader is never used
+
+i2c:
+  - id: touch_bus
+    sda: GPIO19
+    scl: GPIO20
+
+touchscreen:
+  - platform: gt911
+    id: touch
+    i2c_id: touch_bus
+    reset_pin: GPIO38  # no interrupt_pin: GT911 INT is not connected on the 8048S070C
+
 font:
   - id: f_name  # tile titles, e.g. "pH (5.8 – 6.2)" (default GF_Latin_Kernel has "–")
     file: "gfonts://Roboto@400"
@@ -178,7 +205,7 @@ font:
       - "\U000F1A80"  # mdi:thermometer-water
   - id: f_gauge_value
     file: "gfonts://Roboto@500"
-    size: 54
+    size: 44
     bpp: 4
     glyphs: "0123456789.-—"
   - id: f_gauge_name
@@ -218,10 +245,10 @@ lvgl:
         # ---------------- Health Index gauge (left column 14,14 290x452) ----------------
         - meter:
             id: kpi_meter
-            x: 34  # square 250x250, centre at (159,264), arc outer radius 125
-            y: 139
-            width: 250
-            height: 250
+            x: 59  # square 200x200, centre at (159,124), arc outer radius 100
+            y: 24
+            width: 200
+            height: 200
             bg_opa: TRANSP
             border_width: 0
             pad_all: 0
@@ -233,22 +260,22 @@ lvgl:
                 angle_range: 180
                 rotation: 180  # top semicircle, 0 on the left
                 indicators:  # no ticks: key => no ticks or labels
-                  - arc: {color: 0xEF4444, width: 38, start_value: 0, end_value: 65}
-                  - arc: {color: 0xF59E0B, width: 38, start_value: 65, end_value: 85}
-                  - arc: {color: 0x10B981, width: 38, start_value: 85, end_value: 100}
+                  - arc: {color: 0xEF4444, width: 30, start_value: 0, end_value: 65}
+                  - arc: {color: 0xF59E0B, width: 30, start_value: 65, end_value: 85}
+                  - arc: {color: 0x10B981, width: 30, start_value: 85, end_value: 100}
                   - line:
                       id: kpi_needle
                       color: 0xE1E1E1
-                      width: 6
+                      width: 5
                       rounded: true
-                      radial_offset: 70  # from r=70 ...
-                      length: 55         # ... to the arc's outer edge (r=125)
+                      radial_offset: 56  # from r=56 ...
+                      length: 44         # ... to the arc's outer edge (r=100)
                       value: 0
                       opa: 0%            # hidden until the first value arrives
         - label:
             id: kpi_value
             x: 14
-            y: 200
+            y: 70
             width: 290
             text_align: CENTER
             text_font: f_gauge_value
@@ -256,12 +283,77 @@ lvgl:
             text: "—"
         - label:
             x: 14
-            y: 284
+            y: 132
             width: 290
             text_align: CENTER
             text_font: f_gauge_name
             text_color: 0xE1E1E1
             text: "Growell 1 Health Index"
+        # ---------------- Camera (under the gauge) ----------------
+        - image:
+            id: cam_img
+            x: 14
+            y: 176
+            width: 290
+            height: 163
+            src: cam_snapshot
+            bg_color: 0x232325
+            bg_opa: COVER
+            radius: 12
+            clip_corner: true
+        - label:
+            id: cam_status  # "Loading..." / "Camera unavailable" over the picture
+            x: 14
+            y: 243
+            width: 290
+            text_align: CENTER
+            text_font: f_note
+            text_color: 0xE1E1E1
+            bg_color: 0x000000
+            bg_opa: 50%
+            pad_all: 4
+            text: "Loading..."
+        - button:
+            id: cam_prev
+            x: 14
+            y: 349
+            width: 56
+            height: 40
+            radius: 10
+            bg_color: 0x2A2A2C
+            bg_opa: COVER
+            border_width: 0
+            shadow_width: 0
+            text: ""  # LV_SYMBOL_LEFT
+            text_font: montserrat_20
+            text_color: 0xE1E1E1
+            pressed:
+              bg_color: 0x3A3A3C
+        - button:
+            id: cam_next
+            x: 248
+            y: 349
+            width: 56
+            height: 40
+            radius: 10
+            bg_color: 0x2A2A2C
+            bg_opa: COVER
+            border_width: 0
+            shadow_width: 0
+            text: ""  # LV_SYMBOL_RIGHT
+            text_font: montserrat_20
+            text_color: 0xE1E1E1
+            pressed:
+              bg_color: 0x3A3A3C
+        - label:
+            id: cam_name
+            x: 70
+            y: 358
+            width: 178
+            text_align: CENTER
+            text_font: f_note
+            text_color: 0x9B9B9B
+            text: "${cam_1_name}"
         - label:
             id: ha_note  # hidden while Home Assistant is connected
             x: 14
