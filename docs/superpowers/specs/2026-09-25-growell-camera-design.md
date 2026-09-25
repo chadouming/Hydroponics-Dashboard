@@ -47,7 +47,7 @@ tap, and the gauge, graphs and touch stay responsive while pictures download.
 | Gauge value | `f_gauge_value` shrinks 54 → **44 px**; label x 14 w 290, y 70, centred |
 | Gauge name | "Growell 1 Health Index", y 132, centred |
 | Picture `image` | (14, 176), 290×163, background `0x232325`, radius 12, `clip_corner`; snapshot decoded to 289×163 |
-| Status overlay | label over the picture, x 14 w 290, y 243, centred, text `0xE1E1E1` on black 50 %: "Loading…" / "Camera unavailable"; hidden when a fresh picture is shown |
+| Status overlay | label over the picture, x 14 w 290, y 243, centred, text `0xE1E1E1` on black 50 %: "Loading..." / "Camera unavailable" (ASCII, so the default glyph set covers it); hidden when a fresh picture is shown |
 | ‹ button | (14, 349), 56×40, radius 10, `0x2A2A2C`, pressed `0x3A3A3C`, symbol in `montserrat_20` `0xE1E1E1` |
 | › button | (248, 349), same style |
 | Camera name | label x 70 w 178, y 358, centred, `f_note`, secondary `0x9B9B9B` |
