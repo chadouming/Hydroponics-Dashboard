@@ -1,5 +1,5 @@
 # ============================================================================
-# Growell 1 display: Sunton ESP32-8048S070 (7", 800x480, ESP32-S3), ESPHome 2026.5+
+# Growell 1 display: Sunton ESP32-8048S070 (7", 800x480, ESP32-S3), ESPHome 2026.9+
 # Shows the Home Assistant "Growell 1" card: Health Index gauge plus 24 h
 # mini-graphs for pH, EC, ORP and water temperature.
 #
@@ -31,7 +31,7 @@ substitutions:
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
-  min_version: 2026.5.0
+  min_version: 2026.9.0  # the release this file was validated and built with
   on_boot:
     priority: -100
     then:
@@ -48,6 +48,8 @@ esp32:
     advanced:
       # Run code from PSRAM so flash writes (OTA, Wi-Fi config) don't starve the panel.
       execute_from_psram: true
+      # Headroom for drawing graphs from inside the history download handler.
+      loop_task_stack_size: 16384
     sdkconfig_options:
       # Bigger data cache: stops the RGB panel image from drifting under load.
       CONFIG_ESP32S3_DATA_CACHE_64KB: y
@@ -68,12 +70,12 @@ api:
 ota:
   - platform: esphome
 
+# No fallback hotspot / captive portal on purpose: its firmware-upload page has no
+# password and this board holds a Home Assistant token. If the Wi-Fi details
+# change, update the secrets and reinstall over USB.
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  ap:
-
-captive_portal:
 
 time:
   - platform: homeassistant
@@ -395,7 +397,10 @@ script:
           lv_obj_set_style_text_color(UNIT[i], lv_color_hex(col), LV_PART_MAIN);
 
           // History: only real readings, and only once the clock is set.
-          if (std::isnan(v) || !id(ha_time)->now().is_valid())
+          // BEGIN unit live_sample
+          const bool keep = std::isfinite(v);  // NaN = unavailable; inf would wreck the y-range
+          // END unit live_sample
+          if (!keep || !id(ha_time)->now().is_valid())
             return;
           id(graph_advance)->execute(i);
           id(g_sum)[i][47] += v;
@@ -574,9 +579,11 @@ script:
                         const std::string base = "${ha_url}";
                         const char *entity = ENTITY[iteration];
                         // BEGIN unit history_url
-                        std::string url = base;
-                        while (!url.empty() && url.back() == '/')
-                          url.pop_back();
+                        std::string url = base;  // keep scheme://host:port, drop any path copied along
+                        const size_t scheme = url.find("://");
+                        const size_t path = url.find('/', scheme == std::string::npos ? 0 : scheme + 3);
+                        if (path != std::string::npos)
+                          url.erase(path);
                         url += "/api/history/period?filter_entity_id=";
                         url += entity;
                         url += "&minimal_response&no_attributes";  // default window: last 24 h
@@ -624,6 +631,8 @@ script:
                               struct HistParser {
                                 std::function<void(int64_t, float)> on_sample;
                                 bool done = false;
+                                bool started = false;  // saw the opening '['
+                                bool bad = false;      // not a JSON array (e.g. an HTML page): never done
                                 unsigned samples = 0;
                                 int depth = 0;
                                 bool in_str = false, esc = false;
@@ -672,8 +681,16 @@ script:
                                 void feed(const char *p, size_t n) {
                                   const char *const K_STATE = "\"state\":\"";
                                   const char *const K_CHANGED = "\"last_changed\":\"";
-                                  for (size_t j = 0; j < n && !done; j++) {
+                                  for (size_t j = 0; j < n && !done && !bad; j++) {
                                     const char c = p[j];
+                                    if (!started) {
+                                      if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+                                        continue;
+                                      bad = c != '[';  // HA's history is always an array of arrays
+                                      started = true;
+                                      if (bad)
+                                        break;
+                                    }
                                     if (mode != 0) {  // inside a value we want
                                       if (c != '"') {
                                         if (len < (int) sizeof(val) - 1)
@@ -733,7 +750,7 @@ script:
                               parser.on_sample = add_sample;
                               uint8_t chunk[512];
                               uint32_t last_data = millis();
-                              while (!parser.done) {
+                              while (!parser.done && !parser.bad) {
                                 const int n = response->read(chunk, sizeof(chunk));
                                 if (n > 0) {
                                   parser.feed((const char *) chunk, n);
@@ -744,6 +761,10 @@ script:
                                   delay(1);
                                 }
                                 App.feed_wdt();
+                              }
+                              if (parser.bad) {
+                                ESP_LOGW("growell", "History %d: reply is not Home Assistant history - check ha_url", i);
+                                return;
                               }
                               if (!parser.done) {
                                 ESP_LOGW("growell", "History %d: incomplete response (%u bytes), will retry", i,

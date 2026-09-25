@@ -54,6 +54,20 @@ static void test_value_color() {
   CHECK(ec(0) == R);
 }
 
+// ---------------- live_sample ----------------
+static bool live_sample(float v) {
+#include "build/live_sample.inc"
+  return keep;
+}
+
+static void test_live_sample() {
+  CHECK(live_sample(6.02f));
+  CHECK(live_sample(0.0f));
+  CHECK(!live_sample(NAN));        // unavailable / unknown
+  CHECK(!live_sample(INFINITY));   // HA state "inf" would wreck the y-range for 24 h
+  CHECK(!live_sample(-INFINITY));
+}
+
 // ---------------- store_advance / graph_points / graph_range / graph_band ----------------
 using Slots = std::array<float, 48>;
 using Counts = std::array<uint16_t, 48>;
@@ -232,6 +246,10 @@ static void test_history_url() {
   CHECK(history_url("http://ha:8123", "sensor.x") == std::string("http://ha:8123") + tail);
   CHECK(history_url("http://ha:8123/", "sensor.x") == std::string("http://ha:8123") + tail);  // trailing slash
   CHECK(history_url("http://ha:8123//", "sensor.x") == std::string("http://ha:8123") + tail);
+  // A dashboard URL copied from the browser: keep only scheme://host:port.
+  CHECK(history_url("http://ha:8123/lovelace/0", "sensor.x") == std::string("http://ha:8123") + tail);
+  CHECK(history_url("https://ha.example.com/dashboard-garden/0?edit=1", "sensor.x") ==
+        std::string("https://ha.example.com") + tail);
 }
 
 static void test_parse_iso() {
@@ -270,6 +288,15 @@ static void test_parser() {
   CHECK(done && s.empty());
   s = parse_all("<html><body>Login required</body></html>", 512, &done);  // proxy page with HTTP 200
   CHECK(!done && s.empty());
+  // HA's frontend (or an SSO page) answering with HTTP 200: braces in CSS/JS must not look like JSON.
+  s = parse_all("<!DOCTYPE html><html><head><style>html{background:#111}</style>"
+                "<script>window.x={a:[1]};</script></head><body></body></html>",
+                512, &done);
+  CHECK(!done && s.empty());
+  s = parse_all("{\"message\":\"Entity not found.\"}", 512, &done);  // JSON error object with 200
+  CHECK(!done && s.empty());
+  s = parse_all(" \r\n[]", 512, &done);  // leading whitespace before the array is fine
+  CHECK(done && s.empty());
   // Chatty sensor: 10,000 changes (~650 KB) streamed in 512-byte chunks.
   std::string big = "[[{\"entity_id\":\"sensor.x\",\"state\":\"6.00\",\"attributes\":{},"
                     "\"last_changed\":\"2026-09-24T10:00:00+00:00\"}";
@@ -312,6 +339,7 @@ static void test_backfill_accumulate() {
 
 int main() {
   test_value_color();
+  test_live_sample();
   test_store_advance();
   test_graph_points_and_range();
   test_graph_band();
