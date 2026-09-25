@@ -37,6 +37,8 @@ esphome:
   name: ${name}
   friendly_name: ${friendly_name}
   min_version: 2026.9.0  # the release this file was validated and built with
+  includes:
+    - <esp_crt_bundle.h>  # system header (no extra file): CA bundle for an https:// ha_url
   on_boot:
     priority: -100
     then:
@@ -943,44 +945,54 @@ script:
                     esp_http_client_config_t cfg = {};
                     cfg.url = url.c_str();
                     cfg.timeout_ms = 10000;
+                    cfg.crt_bundle_attach = esp_crt_bundle_attach;  // lets an https:// ha_url verify
                     esp_http_client_handle_t c = esp_http_client_init(&cfg);
-                    int http = 0;
+                    int status = -1;   // HTTP status as esp_http_client reports it (-1 = no response)
+                    int64_t n = -1;    // Content-Length (0 = unknown/chunked, < 0 = error)
                     size_t got = 0;
+                    bool read_error = false, overflow = false, complete = false;
                     if (c != nullptr) {
                       esp_http_client_set_header(c, "Authorization", "Bearer ${ha_token}");
                       if (esp_http_client_open(c, 0) == ESP_OK) {
-                        const int64_t n = esp_http_client_fetch_headers(c);
-                        http = esp_http_client_get_status_code(c);
-                        if (http == 200) {
-                          for (;;) {
-                            if (got == CAP) {  // bigger than the buffer: give up, never overflow
-                              http = -1;
+                        n = esp_http_client_fetch_headers(c);
+                        status = esp_http_client_get_status_code(c);
+                        if (status == 200 && n >= 0 && n <= (int64_t) CAP) {  // too-large bodies aren't read
+                          const size_t want = n > 0 ? (size_t) n : CAP;       // unknown length: up to the buffer
+                          while (got < want) {
+                            const int r = esp_http_client_read(c, (char *) s.buf + got, want - got);
+                            if (r < 0) {
+                              read_error = true;
                               break;
                             }
-                            const int r = esp_http_client_read(c, (char *) s.buf + got, CAP - got);
-                            if (r < 0) {  // network error / timeout
-                              http = 0;
-                              break;
-                            }
-                            if (r == 0)  // end of body
+                            if (r == 0)
                               break;
                             got += r;
                           }
-                          if (http == 200 && n > 0 && got != (size_t) n)  // cut short
-                            http = 0;
+                          complete = esp_http_client_is_complete_data_received(c);
+                          overflow = n == 0 && got == CAP && !complete;
                         }
                       }
                       esp_http_client_cleanup(c);
                     }
+                    // BEGIN unit fetch_result
+                    // http: the real HTTP status (>= 100); 0 = no or partial response; -1 = snapshot too large.
+                    int http = status >= 100 ? status : 0;  // esp_http_client reports -1 until a response arrives
+                    if (http == 200) {
+                      if (n > (int64_t) CAP || overflow)
+                        http = -1;
+                      else if (n < 0 || read_error || got == 0 || (n > 0 && got != (size_t) n) || (n == 0 && !complete))
+                        http = 0;
+                    }
+                    // END unit fetch_result
                     if (http == 401 || http == 403)
                       s.auth_failed.store(true);
                     s.cam = cam;
                     s.http = http;
                     s.len = got;
-                    s.state.store(http == 200 && got > 0 ? READY : FAILED);
+                    s.state.store(http == 200 ? READY : FAILED);
                   }
                 },
-                "cam_dl", 8192, nullptr, 1, &task, 0);
+                "cam_dl", 12288, nullptr, 1, &task, 0);  // 12 KB: room for a TLS handshake
             return;
           }
 
@@ -997,16 +1009,64 @@ script:
             if (s.cam == s.want.load()) {  // results for a camera the user left are discarded
               bool shown = false;
               if (st == READY) {
-                auto *img = id(cam_snapshot);
-                if (img->begin_decode(s.len, esphome::runtime_image::JPEG)) {
-                  img->feed_data(s.buf, s.len);
-                  shown = img->end_decode();
+                const uint8_t *buf = s.buf;
+                const size_t len = s.len;
+                // BEGIN unit jpeg_info
+                // Frame size from the JPEG header (SOFn marker), before committing to a decode.
+                int jw = 0, jh = 0;
+                bool found = false, progressive = false;
+                if (len >= 4 && buf[0] == 0xFF && buf[1] == 0xD8) {
+                  size_t i = 2;
+                  while (i + 4 <= len && !found) {
+                    if (buf[i] != 0xFF)
+                      break;  // not at a marker: corrupt
+                    const uint8_t m = buf[i + 1];
+                    if (m == 0xFF) {  // fill byte
+                      i++;
+                      continue;
+                    }
+                    if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+                      if (i + 9 > len)
+                        break;
+                      jh = (buf[i + 5] << 8) | buf[i + 6];
+                      jw = (buf[i + 7] << 8) | buf[i + 8];
+                      progressive = m == 0xC2 || m == 0xC6 || m == 0xCA || m == 0xCE;
+                      found = true;
+                    } else {
+                      i += 2 + (((size_t) buf[i + 2] << 8) | buf[i + 3]);
+                    }
+                  }
                 }
-                if (shown) {
-                  lv_image_set_src(id(cam_img), img->get_lv_image_dsc());
-                  lv_obj_add_flag(id(cam_status), LV_OBJ_FLAG_HIDDEN);
+                // END unit jpeg_info
+                if (!found || progressive) {
+                  ESP_LOGW("camera", "%s: %s", CAM[s.cam], found ? "progressive JPEG is not supported" : "reply is not a JPEG");
+                } else if (jw * jh > 640 * 360) {  // unscaled frame: decoding it would stall the screen for seconds
+                  ESP_LOGW("camera", "%s: HA sent a %dx%d snapshot instead of ~320x180 (can HA scale camera images?)",
+                           CAM[s.cam], jw, jh);
                 } else {
-                  ESP_LOGW("camera", "%s: snapshot could not be decoded (progressive or corrupt JPEG?)", CAM[s.cam]);
+                  auto *img = id(cam_snapshot);
+                  if (img->begin_decode(s.len, esphome::runtime_image::JPEG)) {
+                    size_t off = 0;
+                    bool fed = true;
+                    while (off < s.len) {  // success = every byte consumed (end_decode alone doesn't say)
+                      const int used = img->feed_data(s.buf + off, s.len - off);
+                      if (used <= 0) {
+                        fed = false;
+                        break;
+                      }
+                      off += used;
+                    }
+                    shown = fed && img->end_decode();
+                    if (!shown)
+                      img->release();  // drop the half-painted buffer and close the session
+                  }
+                  if (shown) {
+                    lv_image_set_src(id(cam_img), img->get_lv_image_dsc());
+                    lv_obj_add_flag(id(cam_status), LV_OBJ_FLAG_HIDDEN);
+                  } else {
+                    lv_image_set_src(id(cam_img), (const void *) nullptr);  // never leave LVGL on a released buffer
+                    ESP_LOGW("camera", "%s: snapshot could not be decoded (corrupt JPEG?)", CAM[s.cam]);
+                  }
                 }
               } else if (s.http == 401 || s.http == 403) {
                 ESP_LOGW("camera", "%s: HTTP %d - check the ha_token secret; paused until HA reconnects",
@@ -1033,6 +1093,7 @@ script:
           const int next = ((cur + dir) % n + n) % n;
           // END unit camera_step
           s.want.store(next);
+          lv_image_set_src(id(cam_img), (const void *) nullptr);  // never show the old camera under the new name
           lv_label_set_text(id(cam_name), CAM_NAME[next]);
           lv_label_set_text(id(cam_status), "Loading...");
           lv_obj_remove_flag(id(cam_status), LV_OBJ_FLAG_HIDDEN);

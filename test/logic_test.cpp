@@ -368,6 +368,68 @@ static void test_camera() {
         "http://ha:8123/api/camera_proxy/camera.tapo_cam_1?width=320&height=180");
 }
 
+// ---------------- fetch_result / jpeg_info ----------------
+static int fetch_result(int status, int64_t n, size_t got, bool read_error, bool overflow, bool complete) {
+  constexpr size_t CAP = 256 * 1024;
+#include "build/fetch_result.inc"
+  return http;
+}
+
+static void test_fetch_result() {
+  CHECK(fetch_result(-1, -1, 0, false, false, false) == 0);     // timeout before any response: not "too large"
+  CHECK(fetch_result(-1, -1, 0, false, false, false) != -1);
+  CHECK(fetch_result(200, 20000, 20000, false, false, true) == 200);
+  CHECK(fetch_result(200, 20000, 15000, false, false, false) == 0);   // cut short
+  CHECK(fetch_result(200, 20000, 15000, true, false, false) == 0);    // read error
+  CHECK(fetch_result(200, 300000, 0, false, false, false) == -1);     // Content-Length over the buffer
+  CHECK(fetch_result(200, 262144, 262144, false, false, true) == 200); // exactly the buffer size fits
+  CHECK(fetch_result(200, 0, 20000, false, false, true) == 200);      // chunked, complete
+  CHECK(fetch_result(200, 0, 20000, false, false, false) == 0);       // chunked, cut short
+  CHECK(fetch_result(200, 0, 262144, false, true, false) == -1);      // chunked, filled the buffer
+  CHECK(fetch_result(200, 0, 0, false, false, true) == 0);            // empty body
+  CHECK(fetch_result(401, 0, 0, false, false, false) == 401);
+  CHECK(fetch_result(500, 44, 0, false, false, false) == 500);        // HA's own camera timeout
+}
+
+struct JpegInfo {
+  int w, h;
+  bool found, progressive;
+};
+static JpegInfo jpeg_info(const std::vector<uint8_t> &v) {
+  const uint8_t *buf = v.data();
+  const size_t len = v.size();
+#include "build/jpeg_info.inc"
+  return {jw, jh, found, progressive};
+}
+
+// Minimal JPEG header: SOI, APP0 (JFIF), optional DQT, a fill byte, SOFn, EOI.
+static std::vector<uint8_t> jpeg_header(uint8_t sof, int w, int h, bool with_dqt) {
+  std::vector<uint8_t> v = {0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0};
+  if (with_dqt) {
+    v.insert(v.end(), {0xFF, 0xDB, 0x00, 0x43});
+    v.insert(v.end(), 65, 0x10);
+  }
+  v.insert(v.end(), {0xFF, 0xFF, sof, 0x00, 0x11, 0x08, (uint8_t) (h >> 8), (uint8_t) h, (uint8_t) (w >> 8),
+                     (uint8_t) w, 0x03});
+  v.insert(v.end(), 9, 0x11);  // three component specs
+  v.insert(v.end(), {0xFF, 0xD9});
+  return v;
+}
+
+static void test_jpeg_info() {
+  JpegInfo j = jpeg_info(jpeg_header(0xC0, 320, 180, false));
+  CHECK(j.found && !j.progressive && j.w == 320 && j.h == 180);
+  j = jpeg_info(jpeg_header(0xC0, 1920, 1080, true));  // unscaled 1080p, DQT before the frame header
+  CHECK(j.found && j.w == 1920 && j.h == 1080);
+  j = jpeg_info(jpeg_header(0xC2, 576, 324, true));  // progressive
+  CHECK(j.found && j.progressive && j.w == 576 && j.h == 324);
+  const std::string html = "<html><body>Login</body></html>";
+  CHECK(!jpeg_info(std::vector<uint8_t>(html.begin(), html.end())).found);
+  std::vector<uint8_t> cut = jpeg_header(0xC0, 320, 180, true);
+  cut.resize(30);  // ends inside the DQT segment
+  CHECK(!jpeg_info(cut).found);
+}
+
 int main() {
   test_value_color();
   test_live_sample();
@@ -381,6 +443,8 @@ int main() {
   test_parser();
   test_backfill_accumulate();
   test_camera();
+  test_fetch_result();
+  test_jpeg_info();
   std::printf("%d checks, %d failures\n", checks, failures);
   return failures == 0 ? 0 : 1;
 }

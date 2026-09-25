@@ -72,7 +72,9 @@ loop never does network I/O for the camera.
 - **Origin**: at boot, `ha_url` is reduced once to `scheme://host:port` (new unit `ha_origin`) and
   stored in a global; the history URL and the camera URL both start from it (the history backfill's
   existing trailing-slash / path handling moves into `ha_origin`).
-- **Task** (core 0, priority 1, 6 KB stack, started by op 0 from `on_boot`): loops on
+- **Task** (core 0, priority 1, 12 KB stack so an `https://` origin's TLS handshake fits; the ESP-IDF
+  CA bundle is attached via `esphome: includes: [<esp_crt_bundle.h>]`, a system header, not a file;
+  started by op 0 from `on_boot`): loops on
   `ulTaskNotifyTake(…, 5 s)`; when HA is up, auth hasn't failed and no decoded-but-unshown picture is
   pending, it GETs `{origin}/api/camera_proxy/{entity}?width=320&height=180` with the Bearer token
   (10 s timeout) into a 256 KB PSRAM buffer, then publishes `{camera index, length}` or a failure
@@ -80,12 +82,20 @@ loop never does network I/O for the camera.
 - **Poll** (op 1, every 100 ms from an interval): mirrors `g_ha_up` into the shared state (clearing a
   previous auth failure on a fresh HA connection), then if a download finished:
   - for a camera no longer selected → discard;
-  - otherwise decode (`begin_decode` / `feed_data` / `end_decode`), `lv_image_set_src`, hide the
-    overlay; decode failure → "Camera unavailable" + log;
+  - otherwise read the frame size from the JPEG header (unit `jpeg_info`); refuse non-JPEG,
+    progressive, or frames over 640×360 (an unscaled snapshot would stall the screen) with
+    "Camera unavailable" + a specific log line;
+  - else decode (`begin_decode`, `feed_data` until every byte is consumed, then `end_decode` —
+    `end_decode()` alone does not report success), `lv_image_set_src`, hide the overlay; a failed
+    decode releases the half-painted buffer, clears the picture and shows "Camera unavailable" + log;
   - failure reason → keep the last picture, show "Camera unavailable", log the reason; 401/403 →
     log "check ha_token", stop fetching until HA reconnects.
 - **Next / previous** (ops 2/3, from the buttons' `on_click`): index = wrap(index ± 1) (new unit
-  `camera_step`), update the name label, show "Loading…", wake the task (`xTaskNotifyGive`).
+  `camera_step`), clear the picture (never the old camera under the new name), update the name
+  label, show "Loading...", wake the task (`xTaskNotifyGive`).
+- **Result classification** (unit `fetch_result`): the real HTTP status when one arrived; 0 for no
+  or partial response (timeout, dropped connection, short or incomplete chunked body); -1 when the
+  snapshot is larger than the buffer (refused from its Content-Length before reading).
 - `online_image` is used only as the decode target: `update_interval` stays `never`, its own URL is
   never fetched, `buffer_size: 256` (the minimum) so it doesn't hold a 64 KB download buffer.
 
@@ -95,7 +105,8 @@ loop never does network I/O for the camera.
 |---|---|
 | Timeout / network error / non-200 / body > 256 KB | Last picture stays, "Camera unavailable", log reason, retry next 5 s tick |
 | 401 / 403 | "Camera unavailable", log "check ha_token", no more requests until HA reconnects |
-| Progressive or corrupt JPEG | Decode fails → "Camera unavailable", log |
+| Progressive, non-JPEG, or frame over 640×360 | Refused before decoding → "Camera unavailable", specific log |
+| Corrupt JPEG | Decode fails → picture cleared, "Camera unavailable", log |
 | HA disconnected | No requests |
 | Download finishes for a camera the user already left | Discarded |
 | Before the first picture | Tile colour + "Loading…" |
