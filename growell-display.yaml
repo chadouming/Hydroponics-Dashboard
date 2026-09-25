@@ -25,9 +25,9 @@ substitutions:
   ent_orp: sensor.greenhouse_growell_1_orp_value
   ent_temp: sensor.greenhouse_growell_1_temperature
   # Cameras shown under the gauge (the ‹ › buttons step through them)
-  cam_1: camera.tapo_cam_1
+  cam_1: camera.greenhouse_camera_tapo_cam_1_still  # Generic Camera fed by Frigate's go2rtc frame.jpeg
   cam_1_name: Tapo cam 1
-  cam_2: camera.tapo_cam_2
+  cam_2: camera.greenhouse_camera_tapo_cam_2_still
   cam_2_name: Tapo cam 2
   # Used by the history backfill (Home Assistant REST API)
   ha_url: !secret ha_url
