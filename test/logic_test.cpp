@@ -430,6 +430,54 @@ static void test_jpeg_info() {
   CHECK(!jpeg_info(cut).found);
 }
 
+// ---------------- pointer_geometry / pointer_sdf ----------------
+struct Pointer {
+  float hx, hy, tx, ty, ux, uy;
+};
+static Pointer pointer_geometry(float v, float cx, float cy, float R) {
+#include "build/pointer_geometry.inc"
+  return {hx, hy, tx, ty, ux, uy};
+}
+
+static float pointer_sdf(float dx, float dy, float ux, float uy, float r1, float r2, float h) {
+#include "build/pointer_sdf.inc"
+  return sd;
+}
+
+static void test_pointer_geometry() {
+  // Gauge centre (159, 164), outer radius 140: head at 0.76 R, tip at 0.888 R.
+  Pointer p = pointer_geometry(0, 159, 164, 140);  // 0 points left
+  CHECK_NEAR(p.hx, 159 - 106.4f);
+  CHECK_NEAR(p.hy, 164);
+  CHECK_NEAR(p.tx, 159 - 124.32f);
+  p = pointer_geometry(50, 159, 164, 140);  // 50 points straight up (screen y grows down)
+  CHECK_NEAR(p.hx, 159);
+  CHECK_NEAR(p.hy, 164 - 106.4f);
+  CHECK_NEAR(p.ty, 164 - 124.32f);
+  p = pointer_geometry(100, 159, 164, 140);  // 100 points right
+  CHECK_NEAR(p.hx, 159 + 106.4f);
+  CHECK_NEAR(p.hy, 164);
+  p = pointer_geometry(87, 159, 164, 140);  // the card's example: 23.4 degrees above the right horizon
+  CHECK_NEAR(p.ux, 0.917755f);
+  CHECK_NEAR(p.uy, -0.397148f);
+  Pointer lo = pointer_geometry(-5, 159, 164, 140), hi = pointer_geometry(150, 159, 164, 140);
+  CHECK_NEAR(lo.hx, 159 - 106.4f);  // clamped to 0
+  CHECK_NEAR(hi.hx, 159 + 106.4f);  // clamped to 100
+}
+
+static void test_pointer_sdf() {
+  const float r1 = 6.4f, r2 = 0.8f, h = 17.92f;  // head radius, tip radius, head-to-tip distance
+  CHECK_NEAR(pointer_sdf(0, 0, 1, 0, r1, r2, h), -6.4f);         // head centre
+  CHECK_NEAR(pointer_sdf(17.92f, 0, 1, 0, r1, r2, h), -0.8f);    // tip centre
+  CHECK_NEAR(pointer_sdf(20, 0, 1, 0, r1, r2, h), 1.28f);        // just beyond the tip
+  CHECK_NEAR(pointer_sdf(0, 20, 1, 0, r1, r2, h), 13.6f);        // beside the head
+  CHECK_NEAR(pointer_sdf(-10, 0, 1, 0, r1, r2, h), 3.6f);        // behind the head
+  CHECK(pointer_sdf(9, 0, 1, 0, r1, r2, h) < -3.0f);             // inside, halfway along
+  CHECK(pointer_sdf(9, 5, 1, 0, r1, r2, h) > 0.0f);              // outside the taper
+  CHECK_NEAR(pointer_sdf(0, -17.92f, 0, -1, r1, r2, h), -0.8f);  // pointing up: tip above the head
+  CHECK_NEAR(pointer_sdf(9, 5, 1, 0, r1, r2, h), pointer_sdf(9, -5, 1, 0, r1, r2, h));  // symmetric
+}
+
 int main() {
   test_value_color();
   test_live_sample();
@@ -445,6 +493,8 @@ int main() {
   test_camera();
   test_fetch_result();
   test_jpeg_info();
+  test_pointer_geometry();
+  test_pointer_sdf();
   std::printf("%d checks, %d failures\n", checks, failures);
   return failures == 0 ? 0 : 1;
 }

@@ -43,15 +43,16 @@ tap, and the gauge, graphs and touch stay responsive while pictures download.
 
 | Element | Geometry |
 |---|---|
-| Gauge `meter` | 200×200 at (59, 24) → centre (159, 124), arc radius 100, arc width 30; needle width 5, `radial_offset` 56, `length` 44 |
-| Gauge value | `f_gauge_value` shrinks 54 → **44 px**; label x 14 w 290, y 70, centred |
-| Gauge name | "Growell 1 Health Index", y 132, centred |
-| Picture `image` | (14, 176), 290×163, background `0x232325`, radius 12, `clip_corner`; snapshot decoded to 289×163 |
-| Status overlay | label over the picture, x 14 w 290, y 243, centred, text `0xE1E1E1` on black 50 %: "Loading..." / "Camera unavailable" (ASCII, so the default glyph set covers it); hidden when a fresh picture is shown |
-| ‹ button | (14, 349), 56×40, radius 10, `0x2A2A2C`, pressed `0x3A3A3C`, symbol in `montserrat_20` `0xE1E1E1` |
-| › button | (248, 349), same style |
-| Camera name | label x 70 w 178, y 358, centred, `f_note`, secondary `0x9B9B9B` |
-| HA note | unchanged at y 420 |
+| Gauge `meter` | 280×280 at (19, 24) → centre (159, 164), arc radius 140, arc width 43 (the HA card's proportions); no line needle |
+| Gauge pointer | HA-card teardrop drawn per pixel (signed distance, anti-aliased) into a 48×48 transparent canvas moved onto the pointer: head centre 0.76 R, head radius 0.046 R, tip 0.888 R (radius 0.0057 R), fill `0xE1E1E1`, 0.016 R outline in `0x1C1C1E` that notches the arc; hidden when unavailable |
+| Gauge value | `f_gauge_value` Roboto 400 **52 px** with `%`, e.g. "87%"; label x 14 w 290, y 108, centred |
+| Gauge name | "Growell 1 Health Index", `f_note` 16 px `0xCFCFCF`, y 179, centred |
+| Picture `image` | (14, 253), 290×163, background `0x232325`, radius 12, `clip_corner`; snapshot decoded to 289×163 |
+| Status overlay | label over the picture, x 14 w 290, y 320, centred, text `0xE1E1E1` on black 50 %: "Loading..." / "Camera unavailable" (ASCII, so the default glyph set covers it); hidden when a fresh picture is shown |
+| ‹ button | (14, 426), 56×40, radius 10, `0x2A2A2C`, pressed `0x3A3A3C`, symbol `` in `montserrat_20` `0xE1E1E1` |
+| › button | (248, 426), same style, `` |
+| Camera name | label x 70 w 178, y 435, centred, `f_note`, secondary `0x9B9B9B` |
+| HA note | band over the top of the picture: x 14 w 290, y 257, amber on black 50 % (only while HA is disconnected) |
 
 Cameras are substitutions: `cam_1: camera.tapo_cam_1`, `cam_1_name: Tapo cam 1`,
 `cam_2: camera.tapo_cam_2`, `cam_2_name: Tapo cam 2`. Start on camera 1 (index 0).

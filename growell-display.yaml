@@ -126,15 +126,70 @@ sensor:
     internal: true
     on_value:
       - lambda: |-
-          lv_obj_t *needle = id(kpi_needle)->obj;
+          lv_obj_t *cv = id(kpi_pointer);
           if (std::isnan(x)) {  // unavailable / unknown
             lv_label_set_text(id(kpi_value), "—");
-            lv_obj_set_style_opa(needle, LV_OPA_TRANSP, LV_PART_MAIN);
-          } else {
-            lv_label_set_text_fmt(id(kpi_value), "%.0f", x);
-            id(kpi_needle)->set_value((int) lroundf(x));  // clamped to 0..100
-            lv_obj_set_style_opa(needle, LV_OPA_COVER, LV_PART_MAIN);
+            lv_obj_add_flag(cv, LV_OBJ_FLAG_HIDDEN);
+            return;
           }
+          lv_label_set_text_fmt(id(kpi_value), "%.0f%%", x);
+          // Teardrop pointer like the HA gauge card, drawn with smooth edges into a 48x48
+          // transparent patch that is moved onto the pointer's spot.
+          const float v = x, cx = 159.0f, cy = 164.0f, R = 140.0f;  // gauge centre and outer radius
+          // BEGIN unit pointer_geometry
+          const float vc = std::min(100.0f, std::max(0.0f, v));
+          const float th = 3.14159265f * (1.0f - vc / 100.0f);  // 180 degrees at 0, 0 at 100
+          const float ux = cosf(th), uy = -sinf(th);            // unit vector towards the tip
+          const float hx = cx + 0.76f * R * ux, hy = cy + 0.76f * R * uy;    // head centre
+          const float tx = cx + 0.888f * R * ux, ty = cy + 0.888f * R * uy;  // tip centre
+          // END unit pointer_geometry
+          constexpr int S = 48;
+          const float r1 = 0.046f * R, r2 = 0.0057f * R, h = (0.888f - 0.76f) * R;  // head, tip, length
+          const float o = 0.016f * R;  // outline in the background colour (notches the arc)
+          const int x0 = (int) lroundf((hx + tx) / 2) - S / 2, y0 = (int) lroundf((hy + ty) / 2) - S / 2;
+          lv_obj_set_pos(cv, x0, y0);
+          lv_draw_buf_t *buf = lv_canvas_get_draw_buf(cv);
+          const bool argb = buf->header.cf == LV_COLOR_FORMAT_ARGB8888;
+          const float BG[3] = {0x1C, 0x1C, 0x1E}, FG[3] = {0xE1, 0xE1, 0xE1};  // R, G, B
+          for (int py = 0; py < S; py++) {
+            for (int px = 0; px < S; px++) {
+              const float dx = x0 + px + 0.5f - hx, dy = y0 + py + 0.5f - hy;
+              // BEGIN unit pointer_sdf
+              // Signed distance from (dx, dy), relative to the head centre, to the teardrop: a circle
+              // of radius r1 joined by tangent lines to a circle of radius r2 at distance h along
+              // (ux, uy). Negative inside. (Inigo Quilez's "uneven capsule".)
+              const float ly = dx * ux + dy * uy;
+              const float lx = fabsf(-dx * uy + dy * ux);
+              const float b = (r1 - r2) / h, a = sqrtf(1.0f - b * b);
+              const float k = -b * lx + a * ly;
+              float sd;
+              if (k < 0.0f)
+                sd = sqrtf(lx * lx + ly * ly) - r1;
+              else if (k > a * h)
+                sd = sqrtf(lx * lx + (ly - h) * (ly - h)) - r2;
+              else
+                sd = lx * a + ly * b - r1;
+              // END unit pointer_sdf
+              const float fill = std::min(1.0f, std::max(0.0f, 0.5f - sd));
+              const float outl = std::min(1.0f, std::max(0.0f, 0.5f - (sd - o)));
+              const float f = outl > 0.0f ? fill / outl : 0.0f;  // fill share inside the outlined shape
+              const uint8_t r = (uint8_t) lroundf(BG[0] + (FG[0] - BG[0]) * f);
+              const uint8_t g = (uint8_t) lroundf(BG[1] + (FG[1] - BG[1]) * f);
+              const uint8_t bl = (uint8_t) lroundf(BG[2] + (FG[2] - BG[2]) * f);
+              const uint8_t al = (uint8_t) lroundf(255.0f * outl);
+              if (argb) {
+                uint8_t *p = buf->data + py * buf->header.stride + px * 4;  // B, G, R, A
+                p[0] = bl;
+                p[1] = g;
+                p[2] = r;
+                p[3] = al;
+              } else {
+                lv_canvas_set_px(cv, px, py, lv_color_make(r, g, bl), al);
+              }
+            }
+          }
+          lv_obj_invalidate(cv);
+          lv_obj_remove_flag(cv, LV_OBJ_FLAG_HIDDEN);
   - platform: homeassistant
     id: ph
     entity_id: ${ent_ph}
@@ -207,14 +262,10 @@ font:
       - "\U000F1855"  # mdi:water-opacity
       - "\U000F1A80"  # mdi:thermometer-water
   - id: f_gauge_value
-    file: "gfonts://Roboto@500"
-    size: 44
-    bpp: 4
-    glyphs: "0123456789.-—"
-  - id: f_gauge_name
     file: "gfonts://Roboto@400"
-    size: 20
+    size: 52
     bpp: 4
+    glyphs: "0123456789.-—%"
   - id: f_note
     file: "gfonts://Roboto@400"
     size: 16
@@ -248,10 +299,10 @@ lvgl:
         # ---------------- Health Index gauge (left column 14,14 290x452) ----------------
         - meter:
             id: kpi_meter
-            x: 59  # square 200x200, centre at (159,124), arc outer radius 100
+            x: 19  # square 280x280, centre at (159,164), arc outer radius 140
             y: 24
-            width: 200
-            height: 200
+            width: 280
+            height: 280
             bg_opa: TRANSP
             border_width: 0
             pad_all: 0
@@ -262,23 +313,22 @@ lvgl:
                 range_to: 100
                 angle_range: 180
                 rotation: 180  # top semicircle, 0 on the left
-                indicators:  # no ticks: key => no ticks or labels
-                  - arc: {color: 0xEF4444, width: 30, start_value: 0, end_value: 65}
-                  - arc: {color: 0xF59E0B, width: 30, start_value: 65, end_value: 85}
-                  - arc: {color: 0x10B981, width: 30, start_value: 85, end_value: 100}
-                  - line:
-                      id: kpi_needle
-                      color: 0xE1E1E1
-                      width: 5
-                      rounded: true
-                      radial_offset: 56  # from r=56 ...
-                      length: 44         # ... to the arc's outer edge (r=100)
-                      value: 0
-                      opa: 0%            # hidden until the first value arrives
+                indicators:  # no ticks: key => no ticks or labels; pointer drawn on kpi_pointer
+                  - arc: {color: 0xEF4444, width: 43, start_value: 0, end_value: 65}
+                  - arc: {color: 0xF59E0B, width: 43, start_value: 65, end_value: 85}
+                  - arc: {color: 0x10B981, width: 43, start_value: 85, end_value: 100}
+        - canvas:
+            id: kpi_pointer  # 48x48 patch moved to the pointer and redrawn on each value
+            x: 0
+            y: 0
+            width: 48
+            height: 48
+            transparent: true
+            hidden: true
         - label:
             id: kpi_value
             x: 14
-            y: 70
+            y: 108
             width: 290
             text_align: CENTER
             text_font: f_gauge_value
@@ -286,17 +336,17 @@ lvgl:
             text: "—"
         - label:
             x: 14
-            y: 132
+            y: 179
             width: 290
             text_align: CENTER
-            text_font: f_gauge_name
-            text_color: 0xE1E1E1
+            text_font: f_note
+            text_color: 0xCFCFCF
             text: "Growell 1 Health Index"
         # ---------------- Camera (under the gauge) ----------------
         - image:
             id: cam_img
             x: 14
-            y: 176
+            y: 253
             width: 290
             height: 163
             src: cam_snapshot
@@ -307,7 +357,7 @@ lvgl:
         - label:
             id: cam_status  # "Loading..." / "Camera unavailable" over the picture
             x: 14
-            y: 243
+            y: 320
             width: 290
             text_align: CENTER
             text_font: f_note
@@ -319,7 +369,7 @@ lvgl:
         - button:
             id: cam_prev
             x: 14
-            y: 349
+            y: 426
             width: 56
             height: 40
             radius: 10
@@ -327,7 +377,7 @@ lvgl:
             bg_opa: COVER
             border_width: 0
             shadow_width: 0
-            text: ""  # LV_SYMBOL_LEFT
+            text: "\uF053"  # LV_SYMBOL_LEFT
             text_font: montserrat_20
             text_color: 0xE1E1E1
             pressed:
@@ -337,7 +387,7 @@ lvgl:
         - button:
             id: cam_next
             x: 248
-            y: 349
+            y: 426
             width: 56
             height: 40
             radius: 10
@@ -345,7 +395,7 @@ lvgl:
             bg_opa: COVER
             border_width: 0
             shadow_width: 0
-            text: ""  # LV_SYMBOL_RIGHT
+            text: "\uF054"  # LV_SYMBOL_RIGHT
             text_font: montserrat_20
             text_color: 0xE1E1E1
             pressed:
@@ -355,20 +405,23 @@ lvgl:
         - label:
             id: cam_name
             x: 70
-            y: 358
+            y: 435
             width: 178
             text_align: CENTER
             text_font: f_note
             text_color: 0x9B9B9B
             text: "${cam_1_name}"
         - label:
-            id: ha_note  # hidden while Home Assistant is connected
+            id: ha_note  # over the top of the picture; hidden while Home Assistant is connected
             x: 14
-            y: 420
+            y: 257
             width: 290
             text_align: CENTER
             text_font: f_note
             text_color: 0xF59E0B
+            bg_color: 0x000000
+            bg_opa: 50%
+            pad_all: 4
             text: "Home Assistant disconnected"
         # ---------------- pH tile ----------------
         - obj:
