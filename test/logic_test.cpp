@@ -182,12 +182,144 @@ static void test_segment_cuts() {
   CHECK(cuts_are(segment_cuts(3, 30, 10), {0, 0.2995f, 0.4495f, 0.6f, 0.7f, 1}));
 }
 
+// ---------------- history_url / backfill_accumulate / hist_parser ----------------
+static std::string history_url(const std::string &base, const char *entity) {
+#include "build/history_url.inc"
+  return url;
+}
+
+struct Acc {
+  Slots sum{};
+  Counts cnt{};
+  float carry = NAN;
+};
+static void backfill_accumulate(Acc &acc, int32_t h_now, const std::vector<std::pair<int64_t, float>> &samples) {
+  auto &sum = acc.sum;
+  auto &cnt = acc.cnt;
+  auto &carry = acc.carry;
+#include "build/backfill_accumulate.inc"
+  for (const auto &s : samples)
+    add_sample(s.first, s.second);
+}
+
+#include "build/hist_parser.inc"
+
+// Feed `json` in pieces of `chunk` bytes; collect the samples.
+static std::vector<std::pair<int64_t, float>> parse_all(const std::string &json, size_t chunk, bool *done) {
+  std::vector<std::pair<int64_t, float>> out;
+  HistParser p;
+  p.on_sample = [&](int64_t t, float v) { out.emplace_back(t, v); };
+  for (size_t pos = 0; pos < json.size(); pos += chunk)
+    p.feed(json.data() + pos, std::min(chunk, json.size() - pos));
+  if (done)
+    *done = p.done;
+  CHECK(p.samples == out.size());
+  return out;
+}
+
+static const int64_t T_10_00 = 1790244000;  // 2026-09-24T10:00:00Z
+static const int32_t H_NOW = 994628;        // half-hour of 2026-09-25T10:00:00Z
+static const std::string SAMPLE =
+    "[[{\"entity_id\":\"sensor.greenhouse_growell_1_ph\",\"state\":\"6.10\",\"attributes\":{},"
+    "\"last_changed\":\"2026-09-24T10:00:00+00:00\",\"last_reported\":\"2026-09-24T10:00:00+00:00\","
+    "\"last_updated\":\"2026-09-24T10:00:00+00:00\"},"
+    "{\"state\":\"6.20\",\"last_changed\":\"2026-09-24T10:14:59.5+00:00\"},"
+    "{\"state\":\"unavailable\",\"last_changed\":\"2026-09-24T11:00:00+00:00\"},"
+    "{\"state\":\"5.90\",\"last_changed\":\"2026-09-24T12:00:00.123456Z\"}]]";
+
+static void test_history_url() {
+  const char *tail = "/api/history/period?filter_entity_id=sensor.x&minimal_response&no_attributes";
+  CHECK(history_url("http://ha:8123", "sensor.x") == std::string("http://ha:8123") + tail);
+  CHECK(history_url("http://ha:8123/", "sensor.x") == std::string("http://ha:8123") + tail);  // trailing slash
+  CHECK(history_url("http://ha:8123//", "sensor.x") == std::string("http://ha:8123") + tail);
+}
+
+static void test_parse_iso() {
+  int64_t t = -1;
+  CHECK(HistParser::parse_iso("2026-09-24T22:15:00+00:00", t) && t == 1790288100);
+  CHECK(HistParser::parse_iso("2026-09-24T22:15:00.123456+00:00", t) && t == 1790288100);
+  CHECK(HistParser::parse_iso("2026-09-24T22:15:00-05:00", t) && t == 1790306100);
+  CHECK(HistParser::parse_iso("2026-09-24T22:15:00Z", t) && t == 1790288100);
+  CHECK(HistParser::parse_iso("2000-02-29T00:00:00+00:00", t) && t == 951782400);
+  CHECK(HistParser::parse_iso("1970-01-01T00:00:00+00:00", t) && t == 0);
+  CHECK(!HistParser::parse_iso("2026-09-24 22:15:00", t));
+  CHECK(!HistParser::parse_iso("2026-09-24T22:15:00+0000", t));
+  CHECK(!HistParser::parse_iso("unavailable", t));
+}
+
+static void test_parser() {
+  bool done = false;
+  auto s = parse_all(SAMPLE, SAMPLE.size(), &done);
+  CHECK(done);
+  CHECK(s.size() == 3);  // "unavailable" skipped
+  if (s.size() == 3) {
+    CHECK(s[0].first == T_10_00);
+    CHECK_NEAR(s[0].second, 6.10f);
+    CHECK(s[1].first == T_10_00 + 899);
+    CHECK_NEAR(s[1].second, 6.20f);
+    CHECK(s[2].first == T_10_00 + 7200);
+    CHECK_NEAR(s[2].second, 5.90f);
+  }
+  for (size_t chunk = 1; chunk <= 64; chunk++) {  // every possible split of keys/values
+    auto again = parse_all(SAMPLE, chunk, &done);
+    CHECK(done && again == s);
+  }
+  parse_all(SAMPLE.substr(0, SAMPLE.size() - 1), 512, &done);  // cut off before the last ']'
+  CHECK(!done);
+  s = parse_all("[]", 512, &done);  // entity with no history
+  CHECK(done && s.empty());
+  s = parse_all("<html><body>Login required</body></html>", 512, &done);  // proxy page with HTTP 200
+  CHECK(!done && s.empty());
+  // Chatty sensor: 10,000 changes (~650 KB) streamed in 512-byte chunks.
+  std::string big = "[[{\"entity_id\":\"sensor.x\",\"state\":\"6.00\",\"attributes\":{},"
+                    "\"last_changed\":\"2026-09-24T10:00:00+00:00\"}";
+  for (int n = 1; n < 10000; n++)
+    big += ",{\"state\":\"6.01\",\"last_changed\":\"2026-09-24T10:30:00+00:00\"}";
+  big += "]]";
+  s = parse_all(big, 512, &done);
+  CHECK(done && s.size() == 10000);
+}
+
+static void test_backfill_accumulate() {
+  const int64_t slot0 = (int64_t) (H_NOW - 47) * 1800;  // 2026-09-24T10:30:00Z
+  Acc acc;
+  backfill_accumulate(acc, H_NOW,
+                      {{T_10_00, 6.1f},            // before the window -> carry
+                       {T_10_00 + 899, 6.2f},      // also before; latest wins
+                       {slot0, 6.3f},              // first slot
+                       {T_10_00 + 7200, 5.9f},     // 12:00 -> slot 3
+                       {T_10_00 + 7800, 6.1f},     // 12:10 -> slot 3 (mean 6.0)
+                       {(int64_t) H_NOW * 1800 + 3600, 7.0f}});  // HA clock ahead -> slot 47
+  CHECK_NEAR(acc.carry, 6.2f);
+  CHECK(acc.cnt[0] == 1);
+  CHECK_NEAR(acc.sum[0], 6.3f);
+  CHECK(acc.cnt[3] == 2);
+  CHECK_NEAR(acc.sum[3] / acc.cnt[3], 6.0f);
+  CHECK(acc.cnt[47] == 1);
+  CHECK_NEAR(acc.sum[47], 7.0f);
+
+  // Sensor unchanged all day: HA only returns its days-old start state.
+  Acc flat;
+  backfill_accumulate(flat, H_NOW, {{T_10_00 - 3 * 86400, 6.05f}});
+  for (int k = 0; k < 48; k++)
+    CHECK(flat.cnt[k] == 0);
+  Slots pts = graph_points(flat.sum, flat.cnt, flat.carry);
+  for (int k = 0; k < 48; k++)
+    CHECK_NEAR(pts[k], 6.05f);
+  Range r = graph_range(pts);
+  CHECK(r.first == 0 && r.hi > r.lo);
+}
+
 int main() {
   test_value_color();
   test_store_advance();
   test_graph_points_and_range();
   test_graph_band();
   test_segment_cuts();
+  test_history_url();
+  test_parse_iso();
+  test_parser();
+  test_backfill_accumulate();
   std::printf("%d checks, %d failures\n", checks, failures);
   return failures == 0 ? 0 : 1;
 }

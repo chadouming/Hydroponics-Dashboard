@@ -558,6 +558,212 @@ script:
           }
           lv_canvas_finish_layer(cv, &layer);
 
+  # Rebuild each graph that isn't synced yet from HA's last 24 h of history.
+  - id: backfill_all
+    then:
+      - repeat:
+          count: 4
+          then:
+            - if:
+                condition:
+                  lambda: "return (id(g_bf_ok) & (1 << iteration)) == 0;"
+                then:
+                  - http_request.get:
+                      url: !lambda |-
+                        static const char *const ENTITY[4] = {"${ent_ph}", "${ent_ec}", "${ent_orp}", "${ent_temp}"};
+                        const std::string base = "${ha_url}";
+                        const char *entity = ENTITY[iteration];
+                        // BEGIN unit history_url
+                        std::string url = base;
+                        while (!url.empty() && url.back() == '/')
+                          url.pop_back();
+                        url += "/api/history/period?filter_entity_id=";
+                        url += entity;
+                        url += "&minimal_response&no_attributes";  // default window: last 24 h
+                        // END unit history_url
+                        return url;
+                      request_headers:
+                        Authorization: "Bearer ${ha_token}"
+                      capture_response: false  # we stream the body ourselves
+                      on_response:
+                        then:
+                          - lambda: |-
+                              const int i = iteration;
+                              if (response->status_code != 200) {
+                                ESP_LOGW("growell", "History %d: HTTP %d%s", i, response->status_code,
+                                         response->status_code == 401 || response->status_code == 403
+                                             ? " - check the ha_token secret" : "");
+                                return;
+                              }
+                              const auto now = id(ha_time)->now();
+                              if (!now.is_valid())
+                                return;
+                              const int32_t h_now = (int32_t) (now.timestamp / 1800);
+                              std::array<float, 48> sum{};
+                              std::array<uint16_t, 48> cnt{};
+                              float carry = NAN;
+                              // BEGIN unit backfill_accumulate
+                              auto add_sample = [&](int64_t t, float v) {
+                                int32_t k = (int32_t) (t / 1800) - (h_now - 47);
+                                if (k < 0) {  // before the window: only sets the starting value
+                                  carry = v;
+                                  return;
+                                }
+                                if (k > 47)  // HA clock slightly ahead of ours
+                                  k = 47;
+                                sum[k] += v;
+                                if (cnt[k] < 65535)
+                                  cnt[k]++;
+                              };
+                              // END unit backfill_accumulate
+                              // BEGIN unit hist_parser
+                              // Streams HA's minimal history JSON:
+                              //   [[{..."state":"6.1",...,"last_changed":"2026-09-24T10:00:00+00:00",...},
+                              //     {"state":"6.2","last_changed":"..."}, ...]]
+                              // and reports each numeric (timestamp, value) pair. `done` = the JSON closed.
+                              struct HistParser {
+                                std::function<void(int64_t, float)> on_sample;
+                                bool done = false;
+                                unsigned samples = 0;
+                                int depth = 0;
+                                bool in_str = false, esc = false;
+                                int m_state = 0, m_changed = 0;  // progress through the two keys
+                                int mode = 0;                     // 0 scan, 1 state value, 2 timestamp value
+                                char val[40];
+                                int len = 0;
+                                bool have_state = false;
+                                float state = 0;
+
+                                static int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {
+                                  y -= m <= 2;
+                                  const int64_t era = (y >= 0 ? y : y - 399) / 400;
+                                  const unsigned yoe = (unsigned) (y - era * 400);
+                                  const unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+                                  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+                                  return era * 146097 + (int64_t) doe - 719468;
+                                }
+                                // "2026-09-24T22:15:00[.ffffff][+hh:mm|-hh:mm|Z]" -> unix seconds
+                                static bool parse_iso(const char *s, int64_t &out) {
+                                  int y, mo, d, hh, mi, ss, n = 0;
+                                  if (sscanf(s, "%4d-%2d-%2dT%2d:%2d:%2d%n", &y, &mo, &d, &hh, &mi, &ss, &n) != 6 ||
+                                      n != 19)
+                                    return false;
+                                  const char *p = s + n;
+                                  if (*p == '.') {
+                                    p++;
+                                    while (*p >= '0' && *p <= '9')
+                                      p++;
+                                  }
+                                  int off = 0;
+                                  if (*p == '+' || *p == '-') {
+                                    int oh, om, m2 = 0;
+                                    if (sscanf(p + 1, "%2d:%2d%n", &oh, &om, &m2) != 2 || m2 != 5)
+                                      return false;
+                                    off = (oh * 60 + om) * 60 * (*p == '-' ? -1 : 1);
+                                    p += 6;
+                                  } else if (*p == 'Z') {
+                                    p++;
+                                  }
+                                  if (*p != '\0' || mo < 1 || mo > 12 || d < 1 || d > 31)
+                                    return false;
+                                  out = days_from_civil(y, mo, d) * 86400 + hh * 3600 + mi * 60 + ss - off;
+                                  return true;
+                                }
+                                void feed(const char *p, size_t n) {
+                                  const char *const K_STATE = "\"state\":\"";
+                                  const char *const K_CHANGED = "\"last_changed\":\"";
+                                  for (size_t j = 0; j < n && !done; j++) {
+                                    const char c = p[j];
+                                    if (mode != 0) {  // inside a value we want
+                                      if (c != '"') {
+                                        if (len < (int) sizeof(val) - 1)
+                                          val[len++] = c;
+                                        continue;
+                                      }
+                                      val[len] = '\0';
+                                      in_str = false;  // this quote closes the value string
+                                      if (mode == 1) {
+                                        char *end;
+                                        state = strtof(val, &end);
+                                        have_state = end != val && *end == '\0' && std::isfinite(state);
+                                      } else {
+                                        int64_t t;
+                                        if (have_state && parse_iso(val, t)) {
+                                          on_sample(t, state);
+                                          samples++;
+                                        }
+                                        have_state = false;
+                                      }
+                                      mode = 0;
+                                      continue;
+                                    }
+                                    // Track brackets outside strings to know when the document ends.
+                                    if (in_str) {
+                                      if (esc)
+                                        esc = false;
+                                      else if (c == '\\')
+                                        esc = true;
+                                      else if (c == '"')
+                                        in_str = false;
+                                    } else if (c == '"') {
+                                      in_str = true;
+                                    } else if (c == '[' || c == '{') {
+                                      depth++;
+                                    } else if (c == ']' || c == '}') {
+                                      if (--depth == 0)
+                                        done = true;
+                                    }
+                                    m_state = c == K_STATE[m_state] ? m_state + 1 : (c == K_STATE[0] ? 1 : 0);
+                                    m_changed = c == K_CHANGED[m_changed] ? m_changed + 1 : (c == K_CHANGED[0] ? 1 : 0);
+                                    if (K_STATE[m_state] == '\0') {
+                                      mode = 1;
+                                      len = 0;
+                                      have_state = false;
+                                      m_state = m_changed = 0;
+                                    } else if (K_CHANGED[m_changed] == '\0') {
+                                      mode = 2;
+                                      len = 0;
+                                      m_state = m_changed = 0;
+                                    }
+                                  }
+                                }
+                              };
+                              // END unit hist_parser
+                              HistParser parser;
+                              parser.on_sample = add_sample;
+                              uint8_t chunk[512];
+                              uint32_t last_data = millis();
+                              while (!parser.done) {
+                                const int n = response->read(chunk, sizeof(chunk));
+                                if (n > 0) {
+                                  parser.feed((const char *) chunk, n);
+                                  last_data = millis();
+                                } else if (n < 0 || response->is_read_complete() || millis() - last_data > 10000) {
+                                  break;
+                                } else {
+                                  delay(1);
+                                }
+                                App.feed_wdt();
+                              }
+                              if (!parser.done) {
+                                ESP_LOGW("growell", "History %d: incomplete response (%u bytes), will retry", i,
+                                         (unsigned) response->get_bytes_read());
+                                return;
+                              }
+                              id(g_sum)[i] = sum;
+                              id(g_cnt)[i] = cnt;
+                              id(g_carry)[i] = carry;
+                              id(g_head)[i] = h_now;
+                              id(g_bf_ok) |= (uint8_t) (1 << i);
+                              ESP_LOGI("growell", "History %d: %u samples", i, parser.samples);
+                              id(graph_redraw)->execute(i);
+                      on_error:
+                        then:
+                          - logger.log:
+                              format: "History %u: request failed - is ha_url reachable from the display?"
+                              args: ["(unsigned) iteration"]
+      - lambda: "id(g_bf_next) = millis() + 300000;  // retry any failures in 5 min"
+
 globals:
   # 48 half-hour slots per graph (slot 47 = the current half-hour): reading sum and count.
   - id: g_sum
@@ -571,6 +777,17 @@ globals:
   - id: g_carry
     type: std::array<float, 4>
     initial_value: "std::array<float, 4>{NAN, NAN, NAN, NAN}"
+  # Backfill bookkeeping: bit i set = graph i rebuilt from HA on this connection.
+  - id: g_bf_ok
+    type: uint8_t
+    initial_value: "0"
+  - id: g_ha_up
+    type: bool
+    initial_value: "false"
+  # millis() at which the next backfill attempt may start.
+  - id: g_bf_next
+    type: uint32_t
+    initial_value: "0"
 
 interval:
   - interval: 60s
@@ -582,3 +799,28 @@ interval:
             if (id(g_head)[i] != before)
               id(graph_redraw)->execute(i);
           }
+  - interval: 2s
+    then:
+      - lambda: |-
+          // Home Assistant = an API client subscribed to states.
+          const bool up = id(api_server)->is_connected_with_state_subscription();
+          if (up != id(g_ha_up)) {
+            id(g_ha_up) = up;
+            if (up) {
+              lv_obj_add_flag(id(ha_note), LV_OBJ_FLAG_HIDDEN);
+              id(g_bf_ok) = 0;                  // re-sync every graph after each (re)connect
+              id(g_bf_next) = millis() + 3000;  // give HA a moment to send time and states
+            } else {
+              lv_obj_remove_flag(id(ha_note), LV_OBJ_FLAG_HIDDEN);
+            }
+          }
+      - if:
+          condition:
+            lambda: |-
+              return id(g_ha_up) && id(g_bf_ok) != 0x0F && id(ha_time)->now().is_valid() &&
+                     (int32_t) (millis() - id(g_bf_next)) >= 0;
+          then:
+            - script.execute: backfill_all
+
+http_request:
+  timeout: 10s  # HA history queries can take a few seconds
