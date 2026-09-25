@@ -1,2 +1,4 @@
 .esphome/
 test/build/
+# Generated with random throwaway values by tools/esphome.ps1; real secrets live in ESPHome Builder.
+secrets.yaml
