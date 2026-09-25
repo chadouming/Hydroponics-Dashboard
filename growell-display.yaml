@@ -104,22 +104,41 @@ sensor:
     id: kpi
     entity_id: ${ent_kpi}
     internal: true
+    on_value:
+      - lambda: |-
+          lv_obj_t *needle = id(kpi_needle)->obj;
+          if (std::isnan(x)) {  // unavailable / unknown
+            lv_label_set_text(id(kpi_value), "—");
+            lv_obj_set_style_opa(needle, LV_OPA_TRANSP, LV_PART_MAIN);
+          } else {
+            lv_label_set_text_fmt(id(kpi_value), "%.0f", x);
+            id(kpi_needle)->set_value((int) lroundf(x));  // clamped to 0..100
+            lv_obj_set_style_opa(needle, LV_OPA_COVER, LV_PART_MAIN);
+          }
   - platform: homeassistant
     id: ph
     entity_id: ${ent_ph}
     internal: true
+    on_value:
+      - script.execute: {id: tile_update, i: 0, v: !lambda "return x;"}
   - platform: homeassistant
     id: ec
     entity_id: ${ent_ec}
     internal: true
+    on_value:
+      - script.execute: {id: tile_update, i: 1, v: !lambda "return x;"}
   - platform: homeassistant
     id: orp
     entity_id: ${ent_orp}
     internal: true
+    on_value:
+      - script.execute: {id: tile_update, i: 2, v: !lambda "return x;"}
   - platform: homeassistant
     id: temp
     entity_id: ${ent_temp}
     internal: true
+    on_value:
+      - script.execute: {id: tile_update, i: 3, v: !lambda "return x;"}
 
 font:
   - id: f_name  # tile titles, e.g. "pH (5.8 – 6.2)" (default GF_Latin_Kernel has "–")
@@ -340,3 +359,37 @@ lvgl:
                     - label: {id: temp_value, text: "—", text_font: f_value, text_color: 0x9B9B9B}
                     - label: {id: temp_unit, text: "°C", text_font: f_unit, text_color: 0x9B9B9B, pad_bottom: 5}
               - canvas: {id: temp_graph, x: 10, y: 104, width: 207, height: 105, transparent: false}
+
+script:
+  # New reading for tile i (0 pH, 1 EC, 2 ORP, 3 Temp): value text + colour.
+  - id: tile_update
+    parameters:
+      i: int
+      v: float
+    then:
+      - lambda: |-
+          lv_obj_t *const VALUE[4] = {id(ph_value), id(ec_value), id(orp_value), id(temp_value)};
+          lv_obj_t *const UNIT[4] = {id(ph_unit), id(ec_unit), id(orp_unit), id(temp_unit)};
+          static const char *const FORMAT[4] = {"%.2f", "%.0f", "%.0f", "%.1f"};
+          // card_mod colour rules: green lo, green hi, amber lo, amber hi
+          static const float LIMITS[4][4] = {
+              {5.8f, 6.2f, 5.5f, 6.5f}, {2000, 2500, 1800, 2700}, {300, 400, 250, 450}, {18, 21, 16, 24}};
+          const float gLo = LIMITS[i][0], gHi = LIMITS[i][1], aLo = LIMITS[i][2], aHi = LIMITS[i][3];
+          uint32_t col;
+          // BEGIN unit value_color
+          constexpr uint32_t GREY = 0x9B9B9B, RED = 0xEF4444, AMBER = 0xF59E0B, GREEN = 0x10B981;
+          if (std::isnan(v))
+            col = GREY;
+          else if (v >= gLo && v <= gHi)
+            col = GREEN;
+          else if ((v >= aLo && v < gLo) || (v > gHi && v <= aHi))
+            col = AMBER;
+          else
+            col = RED;
+          // END unit value_color
+          if (std::isnan(v))
+            lv_label_set_text(VALUE[i], "—");
+          else
+            lv_label_set_text_fmt(VALUE[i], FORMAT[i], v);
+          lv_obj_set_style_text_color(VALUE[i], lv_color_hex(col), LV_PART_MAIN);
+          lv_obj_set_style_text_color(UNIT[i], lv_color_hex(col), LV_PART_MAIN);
